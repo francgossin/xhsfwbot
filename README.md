@@ -1,4 +1,4 @@
-# xhsfeedbot
+# xhsfwbot
 
 ![](./res/desc.jpg)
 
@@ -16,7 +16,7 @@ A bot that forward REDNote to Telegram Message or Telegraph
 [![Require: paramiko 4.0.0](https://img.shields.io/badge/paramiko-4.0.0-blue)](https://www.paramiko.org/)
 [![Require: FFmpeg](https://shields.io/badge/FFmpeg-%23171717.svg?logo=ffmpeg&style=for-the-badge&labelColor=171717&logoColor=5cb85c)](https://ffmpeg.org)
 
-[![xhsfeed Bot](https://img.shields.io/badge/xhsfeed-Bot-green?logo=telegram)](https://t.me/xhsfeedbot)
+[![xhsfeed Bot](https://img.shields.io/badge/xhsfeed-Bot-green?logo=telegram)](https://t.me/xhsfwbot)
 
 ## Requirements
 
@@ -36,8 +36,8 @@ Download [platform-tools](https://developer.android.com/tools/releases/platform-
 
 ```bash
 sudo apt install libzbar-dev ffmpeg
-git clone https://github.com/francgossin/xhsfeedbot.git
-cd xhsfeedbot
+git clone https://github.com/francgossin/xhsfwbot.git
+cd xhsfwbot
 mkdir -p data
 mkdir -p log
 python3.13 -m venv .venv
@@ -66,10 +66,10 @@ CHANNEL_ID=-1234567890
 
 If you want to enable whitelist, create a channel and add bot as administrator. Anybody in this channel will be recognized as an authorized user.
 
-Run xhsfeedbot.py, the network must have a stable access to Telegram and Gemini.
+Run xhsfwbot.py, the network must have a stable access to Telegram and Gemini.
 ```bash
 # export https_proxy when necessary.
-python xhsfeedbot.py
+python xhsfwbot.py
 ```
 
 Run these two scripts on a local computer with Android phone / emulator / iOS device.
