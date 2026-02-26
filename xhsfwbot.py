@@ -53,7 +53,6 @@ from telegram.error import (
 from telegram.constants import (
     ParseMode,
     ChatAction,
-    ChatMemberStatus,
 )
 from telegraph.aio import Telegraph # type: ignore
 from PIL import Image
@@ -76,12 +75,12 @@ logging.basicConfig(
     ],
     format="%(asctime)s.%(msecs)03d %(levelname)s %(module)s: %(message)s",
     datefmt="%F %A %T",
-    level=logging.DEBUG
+    level=logging.INFO
 )
 
 # Create your own logger for your bot messages
 bot_logger = logging.getLogger("xhsfwbot")
-bot_logger.setLevel(logging.DEBUG)
+bot_logger.setLevel(logging.INFO)
 
 # Global variables for network monitoring
 last_successful_request = time.time()
@@ -92,31 +91,32 @@ is_network_healthy = True
 max_concurrent_requests = 5  # Maximum number of concurrent note processing
 processing_semaphore = asyncio.Semaphore(max_concurrent_requests)
 
-# Whitelist functionality
-whitelist_enabled = os.getenv('WHITELIST_ENABLED', 'false').lower() == 'true'
-bot_logger.debug(f"Whitelist enabled: {whitelist_enabled}")
-private_channel_id = int(os.getenv('CHANNEL_ID', '0'))
-help_message_id = int(os.getenv('HELP_MESSAGE_ID', '0'))
+# Help config file for persisting admin-set help message
+HELP_CONFIG_FILE = 'help_config.json'
+
+def load_help_config() -> dict:
+    """Load help configuration from file"""
+    if os.path.exists(HELP_CONFIG_FILE):
+        try:
+            with open(HELP_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            bot_logger.error(f"Failed to load help config: {e}")
+    return {}
+
+def save_help_config(config: dict) -> None:
+    """Save help configuration to file"""
+    try:
+        with open(HELP_CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        bot_logger.error(f"Failed to save help config: {e}")
+
+help_config = load_help_config()
 
 # Auto restart configuration (in hours, default 24 hours, 0 to disable)
 auto_restart_interval = float(os.getenv('AUTO_RESTART_HOURS', '8'))
 bot_start_time = time.time()
-
-async def is_user_whitelisted(user_id: int | None, bot: Bot | None = None) -> bool:
-    """Check if a user is whitelisted"""
-    if user_id is None:
-        return False
-    if not whitelist_enabled:
-        return True
-    if bot is not None:
-        if private_channel_id:
-            try:
-                member = await bot.get_chat_member(private_channel_id, user_id)
-                if member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-                    return True
-            except BadRequest as e:
-                bot_logger.error(f"Error checking membership for user {user_id} in channel {private_channel_id}: {e}")
-    return False
 
 with open('redtoemoji.json', 'r', encoding='utf-8') as f:
     redtoemoji = json.load(f)
@@ -958,18 +958,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
     chat = update.effective_chat
     
-    if not await is_user_whitelisted(user_id, context.bot):
-        bot_logger.warning(f"Unauthorized access attempt from user {user_id}")
-        if chat:
-            try:
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    text=f"Sorry, you are not authorized to use this bot. If you wish to gain access, please contact the bot administrator.",
-                )
-            except Exception as e:
-                bot_logger.error(f"Failed to send unauthorized message: {e}")
-        return
-    
     if chat:
         try:
             await context.bot.send_message(chat_id=chat.id, text="I'm xhsfwbot, please send me a xhs link!\n/help for more info.")
@@ -983,32 +971,119 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_logger.debug(f"Help requested by user {user_id}")
     chat = update.effective_chat
     
-    if not await is_user_whitelisted(user_id, context.bot):
-        bot_logger.warning(f"Unauthorized access attempt from user {user_id}")
-        if chat:
-            try:
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    text=f"Sorry, you are not authorized to use this bot. If you wish to gain access, please contact the bot administrator.",
-                )
-            except Exception as e:
-                bot_logger.error(f"Failed to send unauthorized message: {e}")
-        return
-    
     if chat:
         try:
-            # Forward the specified help message from the private channel
-            if private_channel_id and help_message_id:
-                await context.bot.forward_message(
+            if help_config.get('type') == 'text':
+                # Admin set a plain-text help message
+                await context.bot.send_message(
                     chat_id=chat.id,
-                    from_chat_id=private_channel_id,
-                    message_id=help_message_id,
+                    text=help_config['text']
+                )
+                update_network_status(success=True)
+            elif help_config.get('type') == 'forward':
+                # Copy (not forward) so the original sender name is not shown
+                await context.bot.copy_message(
+                    chat_id=chat.id,
+                    from_chat_id=help_config['from_chat_id'],
+                    message_id=help_config['message_id'],
                     disable_notification=True
                 )
                 update_network_status(success=True)
+            else:
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text="No help message has been configured yet. Ask the administrator to set one with /sethelp."
+                )
         except Exception as e:
             bot_logger.error(f"Failed to send help message: {e}")
             update_network_status(success=False)
+
+async def sethelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: set the help message sent by /help.
+
+    Usage:
+      /sethelp <text>          — set help to the given text
+      /sethelp (reply to msg) — set help to that replied message (forwarded)
+      /clearhelp               — remove custom help message (revert to default)
+    """
+    global help_config
+    user_id = update.effective_user.id if update.effective_user else None
+    admin_id = os.getenv('ADMIN_ID')
+    chat = update.effective_chat
+    message = update.effective_message
+
+    if not admin_id or str(user_id) != str(admin_id):
+        if chat:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="Sorry, only the administrator can use this command."
+            )
+        return
+
+    if not message or not chat:
+        return
+
+    if message.reply_to_message:
+        # Store the replied-to message as the help content (will be forwarded)
+        reply = message.reply_to_message
+        help_config = {
+            'type': 'forward',
+            'from_chat_id': reply.chat.id,
+            'message_id': reply.message_id
+        }
+        save_help_config(help_config)
+        bot_logger.info(f"Admin {user_id} set help to forwarded message {reply.message_id} from chat {reply.chat.id}")
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text="✅ Help message updated — the replied message will be forwarded when users call /help."
+        )
+    elif context.args:
+        # Store the provided text as the help message
+        help_text = ' '.join(context.args)
+        help_config = {
+            'type': 'text',
+            'text': help_text
+        }
+        save_help_config(help_config)
+        bot_logger.info(f"Admin {user_id} set help to custom text")
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=f"✅ Help message updated to:\n\n{help_text}"
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=(
+                "ℹ️ Usage:\n"
+                "• /sethelp <text> — set help message to the given text\n"
+                "• Reply to any message + /sethelp — use that message as help content\n"
+                "• /clearhelp — remove custom help and revert to default"
+            )
+        )
+
+async def clearhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: clear the custom help message and revert to the default."""
+    global help_config
+    user_id = update.effective_user.id if update.effective_user else None
+    admin_id = os.getenv('ADMIN_ID')
+    chat = update.effective_chat
+
+    if not admin_id or str(user_id) != str(admin_id):
+        if chat:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="Sorry, only the administrator can use this command."
+            )
+        return
+
+    help_config = {}
+    save_help_config(help_config)
+    bot_logger.info(f"Admin {user_id} cleared the custom help message")
+    if chat:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text="✅ Custom help message cleared. /help will now use the default channel message (if configured)."
+        )
 
 async def handle_message_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle message reactions for AI summary trigger"""
@@ -1020,11 +1095,6 @@ async def handle_message_reaction(update: Update, context: ContextTypes.DEFAULT_
     
     user_id = update.effective_user.id if update.effective_user else None
     bot_logger.debug(f"Reaction from user {user_id}: {reaction}")
-    
-    # Check whitelist
-    if not await is_user_whitelisted(user_id, context.bot):
-        bot_logger.warning(f"Unauthorized reaction from user {user_id}")
-        return
     
     # Check if the reaction includes 🤔 (thinking emoji)
     new_reactions = reaction.new_reaction
@@ -1241,12 +1311,6 @@ async def AI_summary_button_callback(update: Update, context: ContextTypes.DEFAU
         return
     
     user_id = update.effective_user.id if update.effective_user else None
-    
-    # Check whitelist
-    if not await is_user_whitelisted(user_id, context.bot):
-        bot_logger.warning(f"Unauthorized callback attempt from user {user_id}")
-        # await query.answer(f"Sorry, you are not authorized to use this feature. If you wish to gain access, please contact the bot administrator.", show_alert=True)
-        return
 
     await query.answer()
     
@@ -1472,27 +1536,6 @@ async def _note2feed_internal(update: Update, context: ContextTypes.DEFAULT_TYPE
         action=ChatAction.TYPING
     )
 
-    # Check whitelist
-    if not await is_user_whitelisted(user_id, context.bot):
-        bot_logger.warning(f"Unauthorized access attempt from user {user_id}")
-        with_xsec_token = bool(re.search(r"[^\S]+-x(?!\S)", message_text))
-        url_info = get_url_info(message_text)
-        if not url_info['success']:
-            return
-        noteId = str(url_info['noteId'])
-        xsec_token = str(url_info['xsec_token'])
-        bot_logger.info(f'Note ID: {noteId}, xsec_token: {xsec_token if xsec_token else "None"}')
-        msg = update.message
-        if msg and chat:
-            try:
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    text=f"Clean URL:\nhttps://www.xiaohongshu.com/discovery/item/{noteId}{f'?xsec_token={xsec_token}' if xsec_token and with_xsec_token else ''}",
-                    reply_to_message_id=msg.message_id
-                )
-            except Exception as e:
-                bot_logger.error(f"Failed to send unauthorized message: {e}")
-        return
     # If there is a photo, try to decode QR code
     if msg.photo:
         try:
@@ -1707,29 +1750,6 @@ async def _inline_note2feed_internal(update: Update, context: ContextTypes.DEFAU
     anchorCommentId = str(url_info['anchorCommentId'])
     bot_logger.info(f'Note ID: {noteId}, xsec_token: {xsec_token if xsec_token else "None"}, anchorCommentId: {anchorCommentId if anchorCommentId else "None"}')
 
-    # Check whitelist
-    if not await is_user_whitelisted(user_id, context.bot):
-        bot_logger.warning(f"Unauthorized inline access attempt from user {user_id}")
-        if inline_query:
-            try:
-                await context.bot.answer_inline_query(
-                    inline_query_id=inline_query.id,
-                    results=[
-                        InlineQueryResultArticle(
-                            id=str(uuid4()),
-                            title="Clean URL",
-                            input_message_content=InputTextMessageContent(
-                                message_text=f"https://www.xiaohongshu.com/discovery/item/{noteId}{f'?xsec_token={xsec_token}' if xsec_token and with_xsec_token else ''}",
-                            ),
-                            description="Clean xiaohongshu.com URL without tracking parameters",
-                        )
-                    ],
-                    cache_time=0
-                )
-            except Exception as e:
-                bot_logger.error(f"Failed to respond to unauthorized inline query: {e}")
-        return
-
     bot_logger.debug('try open note on device')
     open_note(noteId, anchorCommentId=anchorCommentId)
     await asyncio.sleep(3)
@@ -1834,7 +1854,20 @@ async def error_handler(update: Any, context: ContextTypes.DEFAULT_TYPE) -> None
     ]
     
     if isinstance(context.error, NetworkError) or any(keyword in error_str for keyword in network_keywords):
-        bot_logger.error(f"Network-related error detected:\n{context.error}\n\n{traceback.format_exc()}")
+        # Format full traceback with the chained cause so the exact httpx call site is visible
+        tb = traceback.format_exc()
+        cause_tb = ""
+        if context.error.__cause__ is not None:
+            cause_tb = f"\nCaused by: {''.join(traceback.format_exception(type(context.error.__cause__), context.error.__cause__, context.error.__cause__.__traceback__))}"
+        update_info = f"update={pformat(update)}" if update else "update=None"
+        bot_logger.error(
+            f"Network-related error detected:\n"
+            f"  Error type : {type(context.error).__name__}\n"
+            f"  Error      : {context.error}\n"
+            f"  {update_info}\n"
+            f"--- Traceback ---\n{tb}"
+            f"{cause_tb}"
+        )
         update_network_status(success=False)
         if not is_network_healthy or not check_network_connectivity():
             bot_logger.error("Network appears unhealthy - triggering restart")
@@ -1893,6 +1926,10 @@ def run_telegram_bot():
         application.add_handler(start_handler)
         help_handler = CommandHandler("help", help)
         application.add_handler(help_handler)
+        sethelp_handler = CommandHandler("sethelp", sethelp)
+        application.add_handler(sethelp_handler)
+        clearhelp_handler = CommandHandler("clearhelp", clearhelp)
+        application.add_handler(clearhelp_handler)
         
         # AI summary button callback handler disabled
         # AI_summary_button_callback_handler = CallbackQueryHandler(AI_summary_button_callback)
