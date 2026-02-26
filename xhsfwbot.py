@@ -80,7 +80,7 @@ logging.basicConfig(
 )
 
 # Create your own logger for your bot messages
-bot_logger = logging.getLogger("xhsfeedbot")
+bot_logger = logging.getLogger("xhsfwbot")
 bot_logger.setLevel(logging.DEBUG)
 
 # Global variables for network monitoring
@@ -183,7 +183,7 @@ def update_network_status(success: bool = True):
         current_time = time.time()
         if current_time - last_successful_request > network_timeout_threshold:
             is_network_healthy = False
-            bark_notify("xhsfeedbot network is unhealthy.")
+            bark_notify("xhsfwbot network is unhealthy.")
 
 def network_monitor():
     """Background network monitoring function"""
@@ -218,7 +218,7 @@ def scheduled_restart_monitor():
             uptime = time.time() - bot_start_time
             if uptime >= restart_interval_seconds:
                 bot_logger.info(f"Scheduled restart triggered after {uptime/3600:.2f} hours of uptime")
-                bark_notify(f"xhsfeedbot scheduled restart after {uptime/3600:.1f}h uptime")
+                bark_notify(f"xhsfwbot scheduled restart after {uptime/3600:.1f}h uptime")
                 restart_script()
                 break
         except Exception as e:
@@ -469,7 +469,7 @@ class Note:
         if not self.telegraph_account:
             self.telegraph_account = Telegraph()
             await self.telegraph_account.create_account( # type: ignore
-                short_name='@xhsfeedbot',
+                short_name='@xhsfwbot',
             )
         response = await self.telegraph_account.create_page( # type: ignore
             title=f"{self.title} @{self.user['name']}",
@@ -972,7 +972,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if chat:
         try:
-            await context.bot.send_message(chat_id=chat.id, text="I'm xhsfeedbot, please send me a xhs link!\n/help for more info.")
+            await context.bot.send_message(chat_id=chat.id, text="I'm xhsfwbot, please send me a xhs link!\n/help for more info.")
             update_network_status(success=True)
         except Exception as e:
             bot_logger.error(f"Failed to send start message: {e}")
@@ -1581,7 +1581,7 @@ async def _note2feed_internal(update: Update, context: ContextTypes.DEFAULT_TYPE
             await telegraph_account.get_account_info()  # type: ignore
         except:
             await telegraph_account.create_account( # type: ignore
-                short_name='@xhsfeedbot',
+                short_name='@xhsfwbot',
             )
         note = Note(
             note_data['data'],
@@ -1774,7 +1774,7 @@ async def _inline_note2feed_internal(update: Update, context: ContextTypes.DEFAU
             await telegraph_account.get_account_info()  # type: ignore
         except:
             await telegraph_account.create_account( # type: ignore
-                short_name='@xhsfeedbot',
+                short_name='@xhsfwbot',
             )
         note = Note(
             note_data['data'],
@@ -1823,7 +1823,7 @@ async def error_handler(update: Any, context: ContextTypes.DEFAULT_TYPE) -> None
     # Check for pool timeout - this is critical and should trigger immediate restart
     if 'pool timeout' in error_str or 'all connections in the connection pool are occupied' in error_str:
         bot_logger.error(f"CRITICAL: Pool timeout detected - triggering immediate restart:\n{context.error}")
-        bark_notify("xhsfeedbot: Pool timeout detected, restarting immediately")
+        bark_notify("xhsfwbot: Pool timeout detected, restarting immediately")
         restart_script()
         return
     
@@ -1887,7 +1887,7 @@ def run_telegram_bot():
         .concurrent_updates(True)\
         .build()
 
-    bark_notify("xhsfeedbot tries to start polling.")
+    bark_notify("xhsfwbot tries to start polling.")
     try:
         start_handler = CommandHandler("start", start)
         application.add_handler(start_handler)
@@ -1978,7 +1978,7 @@ def bark_notify(message: str) -> None:
             payload = json.dumps({
                 "body": message,
                 "sound": "birdsong",
-                "title": "xhsfeedbot"
+                "title": "xhsfwbot"
             }, ensure_ascii=False)
             
             # Ensure key is 32 bytes (256 bits for AES-256)
@@ -1986,7 +1986,7 @@ def bark_notify(message: str) -> None:
                 bot_logger.error(f'BARK_KEY must be exactly 32 characters long, got {len(bark_key)}')
                 # Fall back to unencrypted
                 requests.get(
-                    f'https://api.day.app/{bark_token}/{quote("xhsfeedbot")}/{quote(message)}'
+                    f'https://api.day.app/{bark_token}/{quote("xhsfwbot")}/{quote(message)}'
                 )
                 return
             
@@ -2017,7 +2017,7 @@ def bark_notify(message: str) -> None:
         else:
             # Send unencrypted notification (original behavior)
             requests.get(
-                f'https://api.day.app/{bark_token}/{quote("xhsfeedbot")}/{quote(message)}'
+                f'https://api.day.app/{bark_token}/{quote("xhsfwbot")}/{quote(message)}'
             )
             bot_logger.info('Bark notification sent successfully')
             
@@ -2027,7 +2027,7 @@ def bark_notify(message: str) -> None:
 def restart_script():
     bot_logger.info("Restarting script...")
     # notify bot owner with bark
-    bark_notify("xhsfeedbot is restarting due to network issues.")
+    bark_notify("xhsfwbot is restarting due to network issues.")
     try:
         process = psutil.Process(os.getpid())
         for handler in process.open_files() + process.net_connections():
@@ -2044,3 +2044,4 @@ if __name__ == "__main__":
         run_telegram_bot()
     except Exception as e:
         restart_script()
+
