@@ -103,5 +103,5 @@ def get_comment_list(note_id: str):
     return json_data
 
 if __name__ == "__main__":
-    port = os.getenv("SHARED_SERVER_PORT")
+    port = os.getenv("FLASK_SERVER_PORT")
     app.run(port=int(port) if port else 5001)
