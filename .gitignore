@@ -1,6 +1,8 @@
 # Environment variables
 .env
 whitelist.json
+.nginx.conf
+help_config.json
 
 # Python
 __pycache__/
