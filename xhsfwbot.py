@@ -322,10 +322,6 @@ class Note:
                 self.video_url = re.sub(r'[0-9a-z\-]+\.xhscdn\.(com|net)', 'sns-bak-v1.xhscdn.com', self.video_url) #.split('?imageView')[0] + '?imageView2/2/w/5000/h/5000/format/webp/q/56&redImage/frame/0'
         if telegraph:
             self.to_html()
-        tgmsg_result = self.to_telegram_message(preview=bool(self.length >= 666))
-        bot_logger.debug(f"tgmsg_result: {tgmsg_result}\nlen: {self.length}, preview? = {bool(self.length >= 666)}")
-        media_group_result = self.to_media_group()
-        bot_logger.debug(f"media_group_result: {media_group_result}")
 
     async def initialize(self) -> None:
         if self.telegraph:
@@ -518,7 +514,9 @@ class Note:
             ip_html = tg_msg_escape_markdown_v2(self.ip_location)
         else:
             ip_html = '?'
-        message += f'>📍 {ip_html}\n\n📕 [Note Source]({self.url})'
+        message += f'>📍 {ip_html}\n\n'
+        if not self.title:
+            message += f'📕 [Note Source]({self.url})'
         self.message = message
         bot_logger.debug(f"Telegram message generated, \n\n{self.message}\n\n")
         return message
@@ -1647,7 +1645,7 @@ async def _note2feed_internal(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await note.to_telegraph()
             telegraph_msg = await context.bot.send_message(
                 chat_id = chat.id,
-                text = f"📕 [{tg_msg_escape_markdown_v2(note.title)}]({note.url})\n{f"\n{tg_msg_escape_markdown_v2(note.tag_string)}" if note.tags else ""}\n\n👤 [@{tg_msg_escape_markdown_v2(note.user['name'])}](https://www.xiaohongshu.com/user/profile/{note.user['id']})\n\n📰 [View via Telegraph]({note.telegraph_url})",
+                text = f"📕 [{tg_msg_escape_markdown_v2(note.title) if note.title else 'Note Source'}]({note.url})\n{f"\n{tg_msg_escape_markdown_v2(note.tag_string)}" if note.tags else ""}\n\n👤 [@{tg_msg_escape_markdown_v2(note.user['name'])}](https://www.xiaohongshu.com/user/profile/{note.user['id']})\n\n📰 [View via Telegraph]({note.telegraph_url})",
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_to_message_id=msg.message_id,
                 disable_notification=True,
@@ -1813,7 +1811,7 @@ async def _inline_note2feed_internal(update: Update, context: ContextTypes.DEFAU
                 id=str(uuid4()),
                 title=note.title,
                 input_message_content=InputTextMessageContent(
-                    message_text=f"📕 [{tg_msg_escape_markdown_v2(note.title)}]({note.url})\n{f"\n{tg_msg_escape_markdown_v2(note.tag_string)}" if note.tags else ""}\n\n👤 [@{tg_msg_escape_markdown_v2(note.user['name'])}](https://www.xiaohongshu.com/user/profile/{note.user['id']})\n\n📰 [View via Telegraph]({telegraph_url})",
+                    message_text=f"📕 [{tg_msg_escape_markdown_v2(note.title) if note.title else 'Note Source'}]({note.url})\n{f"\n{tg_msg_escape_markdown_v2(note.tag_string)}" if note.tags else ""}\n\n👤 [@{tg_msg_escape_markdown_v2(note.user['name'])}](https://www.xiaohongshu.com/user/profile/{note.user['id']})\n\n📰 [View via Telegraph]({telegraph_url})",
                     parse_mode=ParseMode.MARKDOWN_V2,
                     link_preview_options=LinkPreviewOptions(
                         is_disabled=False,
