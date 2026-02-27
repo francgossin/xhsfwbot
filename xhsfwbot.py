@@ -1522,17 +1522,6 @@ async def _note2feed_internal(update: Update, context: ContextTypes.DEFAULT_TYPE
     if 'xhslink.com' not in message_text and 'xiaohongshu.com' not in message_text and not msg.photo:
         bot_logger.debug(f"No XHS link found in message: {message_text[:100]}")
         return
-    
-    # React with 'OK' gesture when receiving user's message
-    try:
-        await msg.set_reaction("👌")
-    except Exception as e:
-        bot_logger.debug(f"Failed to set OK reaction: {e}")
-    
-    await context.bot.send_chat_action(
-        chat_id=chat.id,
-        action=ChatAction.TYPING
-    )
 
     # If there is a photo, try to decode QR code
     if msg.photo:
@@ -1566,6 +1555,22 @@ async def _note2feed_internal(update: Update, context: ContextTypes.DEFAULT_TYPE
     xsec_token = str(url_info['xsec_token'])
     anchorCommentId = str(url_info['anchorCommentId'])
     bot_logger.info(f'Note ID: {noteId}, xsec_token: {xsec_token if xsec_token else "None"}, anchorCommentId: {anchorCommentId if anchorCommentId else "None"}')
+
+    # React with 'OK' gesture when receiving user's message
+    try:
+        if noteId:
+            await msg.set_reaction("👌")
+            await asyncio.sleep(0.2)
+        else:
+            return
+    except Exception as e:
+        bot_logger.debug(f"Failed to set OK reaction: {e}")
+
+    await context.bot.send_chat_action(
+        chat_id=chat.id,
+        action=ChatAction.TYPING
+    )
+    await asyncio.sleep(0.2)
 
     bot_logger.debug('try open note on device')
     open_note(noteId, anchorCommentId=anchorCommentId)
