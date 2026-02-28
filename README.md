@@ -16,7 +16,7 @@ A bot that forward REDNote to Telegram Message or Telegraph
 [![Require: paramiko 4.0.0](https://img.shields.io/badge/paramiko-4.0.0-blue)](https://www.paramiko.org/)
 [![Require: FFmpeg](https://shields.io/badge/FFmpeg-%23171717.svg?logo=ffmpeg&style=for-the-badge&labelColor=171717&logoColor=5cb85c)](https://ffmpeg.org)
 
-[![xhsfw Bot](https://img.shields.io/badge/xhsfeed-Bot-green?logo=telegram)](https://t.me/xhsfwbot)
+[![xhsfw Bot](https://img.shields.io/badge/xhsfw-Bot-green?logo=telegram)](https://t.me/xhsfwbot)
 
 ## Requirements
 
