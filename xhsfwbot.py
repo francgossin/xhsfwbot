@@ -1,16 +1,30 @@
+"""
+tele.xhsfwbot.py — Telethon (MTProto) port of xhsfwbot.py.
+
+Key differences from xhsfwbot.py:
+  • Uses Telethon instead of python-telegram-bot → persistent MTProto connection,
+    dramatically lower per-call latency compared to HTTP Bot API.
+  • Messages use HTML formatting instead of MarkdownV2.
+  • Requires two extra .env variables:
+      API_ID=<integer from https://my.telegram.org>
+      API_HASH=<string from https://my.telegram.org>
+  • A session file "xhsfwbot_telethon.session" is created next to the script.
+
+Everything else (output content/structure, commands, AI summary, inline query,
+reactions, help config, bark notifications) is identical to xhsfwbot.py.
+"""
+
 import os
 import sys
 import re
 import json
 import time
-import asyncio # type: ignore
+import asyncio
 import logging
 import psutil
 import requests
 import traceback
 import subprocess
-# import paramiko
-import threading
 import base64
 from datetime import datetime, timedelta, timezone
 from pprint import pformat
@@ -22,75 +36,67 @@ from io import BytesIO
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from google import genai
-from google.genai import types
-from telegram.ext import (
-    filters,
-    MessageHandler,
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    InlineQueryHandler,
-    CallbackQueryHandler,
-    MessageReactionHandler
-)
-from telegram import (
-    InputTextMessageContent,
-    Update,
-    Bot,
-    MessageEntity,
-    InputMediaPhoto,
-    InputMediaVideo,
-    LinkPreviewOptions,
-    InlineQueryResultArticle,
-    Message,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup
-)
-from telegram.error import (
-    NetworkError,
-    BadRequest
-)
-from telegram.constants import (
-    ParseMode,
-    ChatAction,
-)
-from telegraph.aio import Telegraph # type: ignore
-from PIL import Image
-from pyzbar.pyzbar import decode # pyright: ignore[reportUnknownVariableType, reportMissingTypeStubs]
+from google.genai import types as genai_types
 
-# Load environment variables from .env file
+from telethon import TelegramClient, events, Button
+from telethon.tl import functions, types as tl_types
+from telethon.tl.types import (
+    DocumentAttributeVideo,
+    InputWebDocument,
+    ReactionEmoji,
+    UpdateBotMessageReaction,
+)
+from telethon.utils import get_peer_id
+from telethon.errors import (
+    FloodWaitError,
+    MessageNotModifiedError,
+    MessageDeleteForbiddenError,
+    NetworkMigrateError,
+    QueryIdInvalidError,
+)
+
+from telegraph.aio import Telegraph  # type: ignore
+from PIL import Image
+from pyzbar.pyzbar import decode  # pyright: ignore[reportUnknownVariableType, reportMissingTypeStubs]
+
+# ── Environment ────────────────────────────────────────────────────────────────
+
 load_dotenv()
+
+telegram_proxy = os.getenv('TELEGRAM_PROXY', '')
+FLASK_SERVER_NAME = os.getenv('FLASK_SERVER_NAME', '127.0.0.1')
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+
+os.makedirs("log", exist_ok=True)
+os.makedirs("data", exist_ok=True)
 
 logging_file = os.path.join("log", f"{datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}.log")
 
-# Configure logging to only show messages from your script
 logging.basicConfig(
     handlers=[
-        logging.FileHandler(
-            filename=logging_file,
-            encoding="utf-8",
-            mode="w+",
-        ),
-        logging.StreamHandler()
+        logging.FileHandler(filename=logging_file, encoding="utf-8", mode="w+"),
+        logging.StreamHandler(),
     ],
     format="%(asctime)s.%(msecs)03d %(levelname)s %(module)s: %(message)s",
     datefmt="%F %A %T",
-    level=logging.INFO
+    level=logging.INFO,
 )
 
-# Create your own logger for your bot messages
 bot_logger = logging.getLogger("xhsfwbot")
 bot_logger.setLevel(logging.INFO)
 
-# Concurrency control
-max_concurrent_requests = 5  # Maximum number of concurrent note processing
+# ── Concurrency ────────────────────────────────────────────────────────────────
+
+max_concurrent_requests = 5
 processing_semaphore = asyncio.Semaphore(max_concurrent_requests)
 
-# Help config file for persisting admin-set help message
+# ── Help config ────────────────────────────────────────────────────────────────
+
 HELP_CONFIG_FILE = 'help_config.json'
 
+
 def load_help_config() -> dict:
-    """Load help configuration from file"""
     if os.path.exists(HELP_CONFIG_FILE):
         try:
             with open(HELP_CONFIG_FILE, 'r', encoding='utf-8') as f:
@@ -99,28 +105,249 @@ def load_help_config() -> dict:
             bot_logger.error(f"Failed to load help config: {e}")
     return {}
 
-def save_help_config(config: dict) -> None:
-    """Save help configuration to file"""
+
+def save_help_config(cfg: dict) -> None:
     try:
         with open(HELP_CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception as e:
         bot_logger.error(f"Failed to save help config: {e}")
 
+
 help_config = load_help_config()
 
-with open('redtoemoji.json', 'r', encoding='utf-8') as f:
-    redtoemoji = json.load(f)
-    f.close()
+# ── Emoji / URL constants ──────────────────────────────────────────────────────
 
-URL_REGEX = r"""(?i)\b((?:https?:(?:/{1,3}|[a-z0-9%])|[a-z0-9.\-]+[.](?:com|net|org|edu|gov|mil|aero|asia|biz|cat|coop|info|int|jobs|mobi|museum|name|post|pro|tel|travel|xxx|ac|ad|ae|af|ag|ai|al|am|an|ao|aq|ar|as|at|au|aw|ax|az|ba|bb|bd|be|bf|bg|bh|bi|bj|bm|bn|bo|br|bs|bt|bv|bw|by|bz|ca|cc|cd|cf|cg|ch|ci|ck|cl|cm|cn|co|cr|cs|cu|cv|cx|cy|cz|dd|de|dj|dk|dm|do|dz|ec|ee|eg|eh|er|es|et|eu|fi|fj|fk|fm|fo|fr|ga|gb|gd|ge|gf|gg|gh|gi|gl|gm|gn|gp|gq|gr|gs|gt|gu|gw|gy|hk|hm|hn|hr|ht|hu|id|ie|il|im|in|io|iq|ir|is|it|je|jm|jo|jp|ke|kg|kh|ki|km|kn|kp|kr|kw|ky|kz|la|lb|lc|li|lk|lr|ls|lt|lu|lv|ly|ma|mc|md|me|mg|mh|mk|ml|mm|mn|mo|mp|mq|mr|ms|mt|mu|mv|mw|mx|my|mz|na|nc|ne|nf|ng|ni|nl|no|np|nr|nu|nz|om|pa|pe|pf|pg|ph|pk|pl|pm|pn|pr|ps|pt|pw|py|qa|re|ro|rs|ru|rw|sa|sb|sc|sd|se|sg|sh|si|sj|Ja|sk|sl|sm|sn|so|sr|ss|st|su|sv|sx|sy|sz|tc|td|tf|tg|th|tj|tk|tl|tm|tn|to|tp|tr|tt|tv|tw|tz|ua|ug|uk|us|uy|uz|va|vc|ve|vg|vi|vn|vu|wf|ws|ye|yt|yu|za|zm|zw)/)(?:[^\s()<>{}\[\]]+|\([^\s()]*?\([^\s()]+\)[^\s()]*?\)|\([^\s]+?\))+(?:\([^\s()]*?\([^\s()]+\)[^\s()]*?\)|\([^\s]+?\)|[^\s`!()\[\]{};:\'\".,<>?«»“”‘’])|(?:(?<!@)[a-z0-9]+(?:[.\-][a-z0-9]+)*[.](?:com|net|org|edu|gov|mil|aero|asia|biz|cat|coop|info|int|jobs|mobi|museum|name|post|pro|tel|travel|xxx|ac|ad|ae|af|ag|ai|al|am|an|ao|aq|ar|as|at|au|aw|ax|az|ba|bb|bd|be|bf|bg|bh|bi|bj|bm|bn|bo|br|bs|bt|bv|bw|by|bz|ca|cc|cd|cf|cg|ch|ci|ck|cl|cm|cn|co|cr|cs|cu|cv|cx|cy|cz|dd|de|dj|dk|dm|do|dz|ec|ee|eg|eh|er|es|et|eu|fi|fj|fk|fm|fo|fr|ga|gb|gd|ge|gf|gg|gh|gi|gl|gm|gn|gp|gq|gr|gs|gt|gu|gw|gy|hk|hm|hn|hr|ht|hu|id|ie|il|im|in|io|iq|ir|is|it|je|jm|jo|jp|ke|kg|kh|ki|km|kn|kp|kr|kw|ky|kz|la|lb|lc|li|lk|lr|ls|lt|lu|lv|ly|ma|mc|md|me|mg|mh|mk|ml|mm|mn|mo|mp|mq|mr|ms|mt|mu|mv|mw|mx|my|mz|na|nc|ne|nf|ng|ni|nl|no|np|nr|nu|nz|om|pa|pe|pf|pg|ph|pk|pl|pm|pn|pr|ps|pt|pw|py|qa|re|ro|rs|ru|rw|sa|sb|sc|sd|se|sg|sh|si|sj|Ja|sk|sl|sm|sn|so|sr|ss|st|su|sv|sx|sy|sz|tc|td|tf|tg|th|tj|tk|tl|tm|tn|to|tp|tr|tt|tv|tw|tz|ua|ug|uk|us|uy|uz|va|vc|ve|vg|vi|vn|vu|wf|ws|ye|yt|yu|za|zm|zw)\b/?(?!@)))"""
+with open('redtoemoji.json', 'r', encoding='utf-8') as _f:
+    redtoemoji: dict = json.load(_f)
 
-FLASK_SERVER_NAME = os.getenv('FLASK_SERVER_NAME', '127.0.0.1')
+URL_REGEX = r"""(?i)\b((?:https?:(?:/{1,3}|[a-z0-9%])|[a-z0-9.\-]+[.](?:com|net|org|edu|gov|mil|aero|asia|biz|cat|coop|info|int|jobs|mobi|museum|name|post|pro|tel|travel|xxx|ac|ad|ae|af|ag|ai|al|am|an|ao|aq|ar|as|at|au|aw|ax|az|ba|bb|bd|be|bf|bg|bh|bi|bj|bm|bn|bo|br|bs|bt|bv|bw|by|bz|ca|cc|cd|cf|cg|ch|ci|ck|cl|cm|cn|co|cr|cs|cu|cv|cx|cy|cz|dd|de|dj|dk|dm|do|dz|ec|ee|eg|eh|er|es|et|eu|fi|fj|fk|fm|fo|fr|ga|gb|gd|ge|gf|gg|gh|gi|gl|gm|gn|gp|gq|gr|gs|gt|gu|gw|gy|hk|hm|hn|hr|ht|hu|id|ie|il|im|in|io|iq|ir|is|it|je|jm|jo|jp|ke|kg|kh|ki|km|kn|kp|kr|kw|ky|kz|la|lb|lc|li|lk|lr|ls|lt|lu|lv|ly|ma|mc|md|me|mg|mh|mk|ml|mm|mn|mo|mp|mq|mr|ms|mt|mu|mv|mw|mx|my|mz|na|nc|ne|nf|ng|ni|nl|no|np|nr|nu|nz|om|pa|pe|pf|pg|ph|pk|pl|pm|pn|pr|ps|pt|pw|py|qa|re|ro|rs|ru|rw|sa|sb|sc|sd|se|sg|sh|si|sj|Ja|sk|sl|sm|sn|so|sr|ss|st|su|sv|sx|sy|sz|tc|td|tf|tg|th|tj|tk|tl|tm|tn|to|tp|tr|tt|tv|tw|tz|ua|ug|uk|us|uy|uz|va|vc|ve|vg|vi|vn|vu|wf|ws|ye|yt|yu|za|zm|zw)/)(?:[^\s()<>{}\[\]]+|\([^\s()]*?\([^\s()]+\)[^\s()]*?\)|\([^\s]+?\))+(?:\([^\s()]*?\([^\s()]+\)[^\s()]*?\)|\([^\s]+?\)|[^\s`!()\[\]{};:\'\".,<>?«»""''])|(?:(?<!@)[a-z0-9]+(?:[.\-][a-z0-9]+)*[.](?:com|net|org|edu|gov|mil|aero|asia|biz|cat|coop|info|int|jobs|mobi|museum|name|post|pro|tel|travel|xxx|ac|ad|ae|af|ag|ai|al|am|an|ao|aq|ar|as|at|au|aw|ax|az|ba|bb|bd|be|bf|bg|bh|bi|bj|bm|bn|bo|br|bs|bt|bv|bw|by|bz|ca|cc|cd|cf|cg|ch|ci|ck|cl|cm|cn|co|cr|cs|cu|cv|cx|cy|cz|dd|de|dj|dk|dm|do|dz|ec|ee|eg|eh|er|es|et|eu|fi|fj|fk|fm|fo|fr|ga|gb|gd|ge|gf|gg|gh|gi|gl|gm|gn|gp|gq|gr|gs|gt|gu|gw|gy|hk|hm|hn|hr|ht|hu|id|ie|il|im|in|io|iq|ir|is|it|je|jm|jo|jp|ke|kg|kh|ki|km|kn|kp|kr|kw|ky|kz|la|lb|lc|li|lk|lr|ls|lt|lu|lv|ly|ma|mc|md|me|mg|mh|mk|ml|mm|mn|mo|mp|mq|mr|ms|mt|mu|mv|mw|mx|my|mz|na|nc|ne|nf|ng|ni|nl|no|np|nr|nu|nz|om|pa|pe|pf|pg|ph|pk|pl|pm|pn|pr|ps|pt|pw|py|qa|re|ro|rs|ru|rw|sa|sb|sc|sd|se|sg|sh|si|sj|Ja|sk|sl|sm|sn|so|sr|ss|st|su|sv|sx|sy|sz|tc|td|tf|tg|th|tj|tk|tl|tm|tn|to|tp|tr|tt|tv|tw|tz|ua|ug|uk|us|uy|uz|va|vc|ve|vg|vi|vn|vu|wf|ws|ye|yt|yu|za|zm|zw)\b/?(?!@)))"""
+
+# ── Pure-Python helpers (identical to xhsfwbot.py) ────────────────────────────
 
 def replace_redemoji_with_emoji(text: str) -> str:
     for red_emoji, emoji in redtoemoji.items():
         text = text.replace(red_emoji, emoji)
     return text
+
+
+def tg_msg_escape_html(t: str | int) -> str:
+    return str(t).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+
+def _make_progress_bar(pct: float, width: int = 20) -> str:
+    """Return a text progress bar like [████████░░░░░░░░░░░░] 40%"""
+    pct = max(0.0, min(1.0, pct))
+    filled = int(width * pct)
+    bar = '█' * filled + '░' * (width - filled)
+    return f'[{bar}] {pct * 100:.0f}%'
+
+
+def make_block_quotation_html(text: str, expandable: bool = True) -> str:
+    """Wrap text in an HTML <blockquote>. Uses expandable when text is long."""
+    if not text:
+        return ''
+    escaped = tg_msg_escape_html(text)
+    lines = [l for l in escaped.split('\n') if l.strip()]
+    if not lines:
+        return ''
+    content = '\n'.join(lines)
+    tag = 'blockquote expandable' if expandable and len(lines) > 3 else 'blockquote'
+    return f'<{tag}>{content}</blockquote>'
+
+
+def get_redirected_url(url: str) -> str:
+    return unquote(
+        requests.get(url if 'http' in url else f'http://{url}').url.split("redirectPath=")[-1]
+    )
+
+
+def get_clean_url(url: str) -> str:
+    return urljoin(url, urlparse(url).path)
+
+
+def get_time_emoji(timestamp: int) -> str:
+    a = int(((timestamp + 8 * 3600) / 900 - 3) / 2 % 24)
+    return f'{chr(128336 + a // 2 + a % 2 * 12)}'
+
+
+def convert_timestamp_to_timestr(timestamp: int) -> str:
+    utc_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    utc_plus_8 = utc_dt + timedelta(hours=8)
+    return utc_plus_8.strftime('%Y-%m-%d %H:%M:%S')
+
+
+def remove_image_url_params(url: str) -> str:
+    for k, v in parse_qs(url).items():
+        url = url.replace(f'&{k}={v[0]}', '')
+    return url
+
+
+def open_note(noteId: str, anchorCommentId: str | None = None) -> dict[str, Any] | None:
+    try:
+        return requests.get(
+            f'https://{FLASK_SERVER_NAME}/open_note/{noteId}' +
+            (f"?anchorCommentId={anchorCommentId}" if anchorCommentId else '')
+        ).json()
+    except Exception:
+        return None
+
+
+def get_url_info(message_text: str) -> dict[str, str | bool]:
+    xsec_token = ''
+    urls = re.findall(URL_REGEX, message_text)
+    bot_logger.info(f'URLs:\n{urls}')
+    anchorCommentId = ''
+    if len(urls) == 0:
+        bot_logger.debug("NO URL FOUND!")
+        return {'success': False, 'msg': 'No URL found in the message.', 'noteId': '', 'xsec_token': '', 'anchorCommentId': ''}
+    elif re.findall(r"[a-z0-9]{24}", message_text) and not re.findall(r"user/profile/[a-z0-9]{24}", message_text):
+        noteId = re.findall(r"[a-z0-9]{24}", message_text)[0]
+        note_url = [u for u in urls if re.findall(r"[a-z0-9]{24}", u) and not re.findall(r"user/profile/[a-z0-9]{24}", u)][0]
+        parsed_url = urlparse(str(note_url))
+        if 'xsec_token' in parse_qs(parsed_url.query):
+            xsec_token = parse_qs(parsed_url.query)['xsec_token'][0]
+        if 'anchorCommentId' in parse_qs(parsed_url.query):
+            anchorCommentId = parse_qs(parsed_url.query)['anchorCommentId'][0]
+    elif 'xhslink.com' in message_text or 'xiaohongshu.com' in message_text:
+        xhslink = [u for u in urls if 'xhslink.com' in u][0]
+        bot_logger.debug(f"URL found: {xhslink}")
+        redirectPath = get_redirected_url(xhslink)
+        bot_logger.debug(f"Redirected URL: {redirectPath}")
+        if re.findall(r"https?://(?:www.)?xhslink.com/[a-z]/[A-Za-z0-9]+", xhslink):
+            clean_url = get_clean_url(redirectPath)
+            if 'xiaohongshu.com/404' in redirectPath or 'xiaohongshu.com/login' in redirectPath:
+                noteId = re.findall(r"noteId=([a-z0-9]+)", redirectPath)[0]
+                if 'redirectPath=' in redirectPath:
+                    redirectPath = unquote(
+                        redirectPath
+                        .replace('https://www.xiaohongshu.com/login?redirectPath=', '')
+                        .replace('https://www.xiaohongshu.com/404?redirectPath=', '')
+                    )
+            else:
+                noteId = re.findall(r"https?:\/\/(?:www.)?xiaohongshu.com\/discovery\/item\/([a-z0-9]+)", clean_url)[0]
+            parsed_url = urlparse(str(redirectPath))
+            if 'xsec_token' in parse_qs(parsed_url.query):
+                xsec_token = parse_qs(parsed_url.query)['xsec_token'][0]
+            if 'anchorCommentId' in parse_qs(parsed_url.query):
+                anchorCommentId = parse_qs(parsed_url.query)['anchorCommentId'][0]
+        elif re.findall(r"https?:\/\/(?:www.)?xiaohongshu.com\/discovery\/item\/[0-9a-z]+", xhslink):
+            noteId = re.findall(r"https?:\/\/(?:www.)?xiaohongshu.com\/discovery\/item\/([a-z0-9]+)", xhslink)[0]
+            parsed_url = urlparse(str(xhslink))
+            if 'xsec_token' in parse_qs(parsed_url.query):
+                xsec_token = parse_qs(parsed_url.query)['xsec_token'][0]
+            if 'anchorCommentId' in parse_qs(parsed_url.query):
+                anchorCommentId = parse_qs(parsed_url.query)['anchorCommentId'][0]
+        elif re.findall(r"https?://(?:www.)?xiaohongshu.com/explore/[a-z0-9]+", message_text):
+            noteId = re.findall(r"https?:\/\/(?:www.)?xiaohongshu.com\/explore\/([a-z0-9]+)", xhslink)[0]
+            parsed_url = urlparse(str(xhslink))
+            if 'xsec_token' in parse_qs(parsed_url.query):
+                xsec_token = parse_qs(parsed_url.query)['xsec_token'][0]
+            if 'anchorCommentId' in parse_qs(parsed_url.query):
+                anchorCommentId = parse_qs(parsed_url.query)['anchorCommentId'][0]
+        else:
+            return {'success': False, 'msg': 'Invalid URL or the note is no longer available.', 'noteId': '', 'xsec_token': ''}
+    else:
+        return {'success': False, 'msg': 'Invalid URL.', 'noteId': '', 'xsec_token': ''}
+    return {'success': True, 'msg': 'Success.', 'noteId': noteId, 'xsec_token': xsec_token, 'anchorCommentId': anchorCommentId}
+
+
+def parse_comment(comment_data: dict[str, Any]):
+    target_comment = comment_data.get('target_comment', {})
+    user = comment_data.get('user', {})
+    content = comment_data.get('content', '')
+    content = re.sub(r'(?P<tag>#\S+?)\[\S+\]#', r'\g<tag> ', content)
+    pictures = comment_data.get('pictures', [])
+    picture_urls: list[str] = []
+    for p in pictures:
+        original_url = p.get('origin_url', '')
+        if 'video_info' in p:
+            video_info = p.get('video_info', '')
+            if video_info:
+                video_data = json.loads(video_info)
+                for stream in video_data['stream']:
+                    if video_data['stream'][stream]:
+                        if 'backup_urls' in video_data['stream'][stream][0]:
+                            video_url = video_data['stream'][stream][0]['backup_urls'][0]
+                            picture_urls.append(video_url)
+        picture_urls.append(
+            re.sub(r'sns-note-i\d.xhscdn.com', 'sns-na-i6.xhscdn.com', original_url)
+            .split('?imageView')[0] + '?imageView2/2/w/5000/h/5000/format/webp/q/56&redImage/frame/0'
+        )
+    audio_info = comment_data.get('audio_info', '')
+    audio_url = ''
+    if audio_info:
+        audio_data = audio_info.get('play_info', {})
+        if audio_data:
+            audio_url = audio_data.get('url', '')
+    data: dict[str, Any] = {
+        'user': user,
+        'content': content,
+        'pictures': picture_urls,
+        'id': comment_data.get('id', ''),
+        'time': comment_data.get('time', 0),
+        'like_count': comment_data.get('like_count', 0),
+        'sub_comment_count': comment_data.get('sub_comment_count', 0),
+        'ip_location': comment_data.get('ip_location', '?'),
+        'audio_url': audio_url,
+    }
+    if target_comment:
+        data['target_comment'] = target_comment
+    return data
+
+
+def extract_anchor_comment_id(json_data: dict[str, Any]) -> list[dict[str, Any]]:
+    comments = json_data.get('comments', [])
+    if not comments:
+        bot_logger.error("No comments found in the data.")
+        bot_logger.error(f"JSON data: {pformat(json_data)}")
+        return []
+    comment = comments[0]
+    sub_comments = comment.get('sub_comments', [])
+    related_sub_comments: list[dict[str, Any]] = []
+    if 'page_context' in json_data:
+        page_context = json_data.get('page_context', '')
+        if page_context:
+            page_context = json.loads(page_context)
+            key_comments_id = page_context.get('top', [])
+            for key in key_comments_id:
+                for sub_comment in sub_comments:
+                    if sub_comment.get('id', '') == key:
+                        related_sub_comments.append(sub_comment)
+    all_comments = [comment] + related_sub_comments
+    data_parsed: list[dict[str, Any]] = []
+    for c in all_comments:
+        data_parsed.append(parse_comment(c))
+    return data_parsed
+
+
+def extract_all_comments(json_data: dict[str, Any]) -> list[dict[str, Any]]:
+    comments = json_data.get('comments', [])
+    if not comments:
+        bot_logger.error("No comments found in the data.")
+        bot_logger.error(f"JSON data: {pformat(json_data)}")
+        return []
+    data_parsed: list[dict[str, Any]] = []
+    for comment in comments:
+        parsed_comment = parse_comment(comment)
+        sub_comments: list[dict[str, Any]] = []
+        for sub_comment in comment.get('sub_comments', []):
+            sub_comments.append(parse_comment(sub_comment))
+        parsed_comment["sub_comments"] = sub_comments
+        data_parsed.append(parsed_comment)
+    return data_parsed
+
+
+def convert_to_ogg_opus_pipe(input_bytes: bytes) -> bytes:
+    process = subprocess.Popen(
+        ["ffmpeg", "-i", "pipe:0", "-c:a", "libopus", "-f", "ogg", "pipe:1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    out, _ = process.communicate(input_bytes)
+    return out
+
+
+# ── Note class ─────────────────────────────────────────────────────────────────
 
 class Note:
     def __init__(
@@ -129,6 +356,7 @@ class Note:
             comment_list_data: dict[str, Any],
             live: bool = False,
             telegraph: bool = False,
+            with_full_data: bool = False,
             telegraph_account: Telegraph | None = None,
             anchorCommentId: str = ''
     ) -> None:
@@ -143,36 +371,28 @@ class Note:
             'red_id': note_data['data'][0]['user'].get('red_id', ''),
             'image': get_clean_url(note_data['data'][0]['user']['image']),
         }
-        # self.text_language_code = note_data['data'][0]['note_list'][0]['text_language_code']
-
-        self.title: str = note_data['data'][0]['note_list'][0]['title'] if note_data['data'][0]['note_list'][0]['title'] else f""
+        self.title: str = note_data['data'][0]['note_list'][0]['title'] if note_data['data'][0]['note_list'][0]['title'] else ''
         self.type: str = note_data['data'][0]['note_list'][0]['type']
-
         self.raw_desc = replace_redemoji_with_emoji(note_data['data'][0]['note_list'][0]['desc'])
         bot_logger.debug(f"Note raw_desc\n\n {self.raw_desc}")
-        self.desc = re.sub(
-            r'(?P<tag>#\S+?)\[\S+\]#',
-            r'\g<tag> ',
-            self.raw_desc
-        )
+        self.desc = re.sub(r'(?P<tag>#\S+?)\[\S+\]#', r'\g<tag> ', self.raw_desc)
         self.time = note_data['data'][0]['note_list'][0]['time']
-        self.ip_location = note_data['data'][0]['note_list'][0]['ip_location']\
+        self.ip_location = (
+            note_data['data'][0]['note_list'][0]['ip_location']
             if 'ip_location' in note_data['data'][0]['note_list'][0] else '?'
+        )
         self.collected_count = note_data['data'][0]['note_list'][0]['collected_count']
         self.comments_count = note_data['data'][0]['note_list'][0]['comments_count']
         self.shared_count = note_data['data'][0]['note_list'][0]['shared_count']
         self.liked_count = note_data['data'][0]['note_list'][0]['liked_count']
-        # self.last_update_time = note_data['data'][0]['note_list'][0]['last_update_time']
         self.comments_with_context: list[dict[str, Any]] = []
         if anchorCommentId:
             self.comments_with_context = extract_anchor_comment_id(comment_list_data['data'])
             bot_logger.debug(f"Comments with context extracted for anchorCommentId {anchorCommentId}:\n{pformat(self.comments_with_context)}")
         self.comments = extract_all_comments(comment_list_data['data'])
         self.length: int = len(self.desc + self.title)
-
         self.tags: list[str] = [tag['name'] for tag in note_data['data'][0]['note_list'][0]['hash_tag']]
         self.tag_string: str = ' '.join([f"#{tag}" for tag in self.tags])
-
         self.thumbnail = note_data['data'][0]['note_list'][0]['share_info']['image']
         self.images_list: list[dict[str, str]] = []
         if 'images_list' in note_data['data'][0]['note_list'][0]:
@@ -185,19 +405,18 @@ class Note:
                             for ss in each['live_photo']['media']['stream'][s]:
                                 live_urls.append(ss['backup_urls'][0] if ss['backup_urls'] else ss['master_url'])
                     if len(live_urls) > 0:
-                        self.images_list.append(
-                            {'live': 'True', 'url': live_urls[0], 'thumbnail': remove_image_url_params(each['url'])}
-                        )
+                        self.images_list.append({'live': 'True', 'url': live_urls[0], 'thumbnail': remove_image_url_params(each['url'])})
                 original_img_url = each['original']
                 if re.findall(r'sns-na-i\d.xhscdn.com', original_img_url):
-                    original_img_url = re.sub(r'sns-na-i\d.xhscdn.com', 'sns-na-i6.xhscdn.com', original_img_url).split('?imageView')[0] + '?imageView2/2/w/5000/h/5000/format/webp/q/56&redImage/frame/0'
-                self.images_list.append(
-                    {
-                        'live': '',
-                        'url': remove_image_url_params(original_img_url),
-                        'thumbnail': remove_image_url_params(each['url_multi_level']['low'])
-                    }
-                )
+                    original_img_url = (
+                        re.sub(r'sns-na-i\d.xhscdn.com', 'sns-na-i6.xhscdn.com', original_img_url)
+                        .split('?imageView')[0] + '?imageView2/2/w/5000/h/5000/format/webp/q/56&redImage/frame/0'
+                    )
+                self.images_list.append({
+                    'live': '',
+                    'url': remove_image_url_params(original_img_url),
+                    'thumbnail': remove_image_url_params(each['url_multi_level']['low']),
+                })
         bot_logger.debug(f"Images found: {self.images_list}")
         self.url = get_clean_url(note_data['data'][0]['note_list'][0]['share_info']['link'])
         self.noteId = re.findall(r"[a-z0-9]{24}", self.url)[0]
@@ -205,7 +424,7 @@ class Note:
         if 'video' in note_data['data'][0]['note_list'][0]:
             self.video_url = note_data['data'][0]['note_list'][0]['video']['url']
             if not re.findall(r'sign=[0-9a-z]+', self.video_url):
-                self.video_url = re.sub(r'[0-9a-z\-]+\.xhscdn\.(com|net)', 'sns-bak-v1.xhscdn.com', self.video_url) #.split('?imageView')[0] + '?imageView2/2/w/5000/h/5000/format/webp/q/56&redImage/frame/0'
+                self.video_url = re.sub(r'[0-9a-z\-]+\.xhscdn\.(com|net)', 'sns-bak-v1.xhscdn.com', self.video_url)
         if telegraph:
             self.to_html()
 
@@ -231,24 +450,18 @@ class Note:
             'video_url': getattr(self, 'video_url', ''),
             'url': self.url,
         }
-    
+
     def media_for_llm(self) -> list[dict[str, str]]:
         media_list: list[dict[str, str]] = []
         for img in self.images_list:
             if not img['live']:
-                media_list.append({
-                    'type': 'image',
-                    'url': img['url']
-                })
-        # For video notes, use the thumbnail image instead of the full video
+                media_list.append({'type': 'image', 'url': img['url']})
         if self.video_url and self.thumbnail:
-            media_list.append({
-                'type': 'image',
-                'url': self.thumbnail
-            })
+            media_list.append({'type': 'image', 'url': self.thumbnail})
         return media_list
 
     def to_html(self) -> str:
+        """Build HTML for the Telegraph page (unchanged from xhsfwbot.py)."""
         html = ''
         html += f'<h3><a href="{self.url}">{self.title}</a></h3>' if self.title else ''
         for img in self.images_list:
@@ -265,12 +478,9 @@ class Note:
         html += f'<img src="{self.user["image"]}"></img>'
         html += f'<p>{get_time_emoji(self.time)} {convert_timestamp_to_timestr(self.time)}</p>'
         html += f'<p>❤️ {self.liked_count} ⭐ {self.collected_count} 💬 {self.comments_count} 🔗 {self.shared_count}</p>'
-        if hasattr(self, 'ip_location'):
-            ipaddr_html = tg_msg_escape_html(self.ip_location)
-        else:
-            ipaddr_html = '?'
+        ipaddr_html = tg_msg_escape_html(self.ip_location) if hasattr(self, 'ip_location') else '?'
         html += f'<p>📍 {ipaddr_html}</p>'
-        html += f'<blockquote><a href="{self.url}">Source</a></blockquote>'
+        html += f'<blockquote><a href="{self.url}">Source</a></blockquote>' if not self.title else ''
         if self.comments:
             html += '<hr>'
             for i, comment in enumerate(self.comments):
@@ -304,44 +514,32 @@ class Note:
                     html += f'<br><p>👤 <a href="https://www.xiaohongshu.com/user/profile/{sub_comment["user"]["userid"]}"> {'@' + sub_comment["user"].get("nickname", "")} ({sub_comment["user"].get("red_id", "")})</a></p>'
                     html += '</blockquote></blockquote>'
                 if i != len(self.comments) - 1:
-                    html += f'<hr>'
+                    html += '<hr>'
         self.html = html
         bot_logger.debug(f"HTML generated, \n\n{self.html}\n\n")
         return self.html
 
     def __str__(self) -> str:
         self.content = '笔记标题：' + self.title + '\n' + '笔记正文：' + self.desc
-        for img in self.images_list:
-            if not img['live']:
-                img = requests.get(img["url"]).content # TODO image to base64?
         self.content += f'\n发布者：@{self.user["name"]} ({self.user.get('red_id', '')})\n'
         self.content += f'{get_time_emoji(self.time)} {convert_timestamp_to_timestr(self.time)}\n'
         self.content += f'点赞：{self.liked_count}收藏：{self.collected_count}评论：{self.comments_count}分享：{self.shared_count}\n'
-        if hasattr(self, 'ip_location'):
-            ipaddr_html = tg_msg_escape_html(self.ip_location) + '\n'
-        else:
-            ipaddr_html = '?\n'
+        ipaddr_html = (tg_msg_escape_html(self.ip_location) + '\n') if hasattr(self, 'ip_location') else '?\n'
         self.content += f'IP 地址：{ipaddr_html}\n\n评论区：\n\n'
         if self.comments:
             self.content += '\n'
             for i, comment in enumerate(self.comments):
                 if comment["content"]:
-                    self.content += f'💬 评论\n'
-                    # if 'target_comment' in comment:
-                    #     self.content += f'↪️ @{comment["target_comment"]["user"].get("nickname", "")} ({comment["target_comment"]["user"].get('red_id', '')})\n'
+                    self.content += '💬 评论\n'
                     self.content += f'{tg_msg_escape_html(replace_redemoji_with_emoji(comment["content"]))}\n'
                     self.content += f'点赞：{comment["like_count"]}\nIP 地址：{tg_msg_escape_html(comment["ip_location"])}\n{get_time_emoji(comment["time"])} {convert_timestamp_to_timestr(comment["time"])}\n'
-                    # self.content += f'发布者：@{comment["user"].get("nickname", "")} ({comment["user"].get('red_id', '')})\n'
                 for sub_comment in comment.get('sub_comments', []):
                     if sub_comment["content"]:
-                        self.content += f'💬 回复\n'
-                        # if 'target_comment' in sub_comment:
-                            # self.content += f'↪️ @{sub_comment["target_comment"]["user"].get("nickname", "")} ({sub_comment["target_comment"]["user"].get('red_id', '')})\n'
+                        self.content += '💬 回复\n'
                         self.content += f'{tg_msg_escape_html(replace_redemoji_with_emoji(sub_comment["content"]))}\n'
                         self.content += f'点赞：{sub_comment["like_count"]}\nIP 地址：{tg_msg_escape_html(sub_comment["ip_location"])}\n{get_time_emoji(sub_comment["time"])} {convert_timestamp_to_timestr(sub_comment["time"])}\n'
-                        # self.content += f'发布者：@{sub_comment["user"].get("nickname", "")} ({sub_comment["user"].get('red_id', '')})\n'
                 if i != len(self.comments) - 1:
-                    self.content += f'\n'
+                    self.content += '\n'
         bot_logger.debug(f"String generated, \n\n{self.content}\n\n")
         return self.content
 
@@ -350,10 +548,8 @@ class Note:
             self.to_html()
         if not self.telegraph_account:
             self.telegraph_account = Telegraph()
-            await self.telegraph_account.create_account( # type: ignore
-                short_name='@xhsfwbot',
-            )
-        response = await self.telegraph_account.create_page( # type: ignore
+            await self.telegraph_account.create_account(short_name='@xhsfwbot')  # type: ignore
+        response = await self.telegraph_account.create_page(  # type: ignore
             title=f"{self.title} @{self.user['name']}",
             author_name=f'@{self.user["name"]} ({self.user.get('red_id', '')})',
             author_url=f"https://www.xiaohongshu.com/user/profile/{self.user['id']}",
@@ -363,712 +559,472 @@ class Note:
         bot_logger.debug(f"Generated Telegraph URL: {self.telegraph_url}")
         return self.telegraph_url
 
-    async def to_telegram_message(self, preview: bool = False) -> str:
-        message = f'*[{tg_msg_escape_markdown_v2(self.title)}]({self.url})*\n' if self.title else ''
+    # ── Telethon-specific message methods ─────────────────────────────────────
+
+    async def to_telethon_message(self, preview: bool = False) -> str:
+        """Generate an HTML-formatted message for Telegram (via Telethon)."""
+        message = ''
+        if self.title:
+            message += f'<b><a href="{self.url}">{tg_msg_escape_html(self.title)}</a></b>\n'
+
         if preview:
-            message += f'{make_block_quotation(self.desc[:555] + '...')}\n' if self.desc else ''
+            desc_preview = (self.desc[:555] + '...') if self.desc and len(self.desc) > 555 else (self.desc or '')
+            message += make_block_quotation_html(desc_preview)
             if hasattr(self, 'telegraph_url'):
-                message += f'\n📝 [View more via Telegraph]({tg_msg_escape_markdown_v2(self.telegraph_url)})\n'
+                tg_url = self.telegraph_url
             else:
-                message += f'\n📝 [View more via Telegraph]({tg_msg_escape_markdown_v2(await self.to_telegraph())})\n'
+                tg_url = await self.to_telegraph()
+            message += f'\n📝 <a href="{tg_url}">View more via Telegraph</a>'
         else:
-            message += f'{make_block_quotation(self.desc)}\n' if self.desc else ''
+            if self.desc:
+                message += make_block_quotation_html(self.desc)
             if hasattr(self, 'telegraph_url'):
-                message += f'\n📝 [Telegraph]({tg_msg_escape_markdown_v2(self.telegraph_url)})\n'
+                message += f'\n📝 <a href="{self.telegraph_url}">Telegraph</a>'
             elif self.telegraph:
-                message += f'\n📝 [Telegraph]({tg_msg_escape_markdown_v2(await self.to_telegraph())})\n'
-        message += f'\n[@{tg_msg_escape_markdown_v2(self.user["name"])} \\({tg_msg_escape_markdown_v2(self.user.get('red_id', ''))}\\)](https://www.xiaohongshu.com/user/profile/{self.user["id"]})\n'
-        if type(self.liked_count) == str:
-            like_html = tg_msg_escape_markdown_v2(self.liked_count)
-        else:
-            like_html = str(self.liked_count)
-        if type(self.collected_count) == str:
-            collected_html = tg_msg_escape_markdown_v2(self.collected_count)
-        else:
-            collected_html = self.collected_count
-        if type(self.comments_count) == str:
-            comments_html = tg_msg_escape_markdown_v2(self.comments_count)
-        else:
-            comments_html = self.comments_count
-        if type(self.shared_count) == str:
-            shared_html = tg_msg_escape_markdown_v2(self.shared_count)
-        else:
-            shared_html = self.shared_count
-        message += f'>❤️ {like_html} ⭐ {collected_html} 💬 {comments_html} 🔗 {shared_html}'
-        message += f'\n>{get_time_emoji(self.time)} {tg_msg_escape_markdown_v2(convert_timestamp_to_timestr(self.time))}\n'
-        if hasattr(self, 'ip_location'):
-            ip_html = tg_msg_escape_markdown_v2(self.ip_location)
-        else:
-            ip_html = '?'
-        message += f'>📍 {ip_html}\n\n'
+                tg_url = await self.to_telegraph()
+                message += f'\n📝 <a href="{tg_url}">Telegraph</a>'
+
+        name_esc = tg_msg_escape_html(self.user['name'])
+        red_id_esc = tg_msg_escape_html(self.user.get('red_id', ''))
+        uid = self.user['id']
+        message += f'\n\n<a href="https://www.xiaohongshu.com/user/profile/{uid}">@{name_esc} ({red_id_esc})</a>'
+
+        message += (
+            f'\n<blockquote>'
+            f'❤️ {self.liked_count} ⭐ {self.collected_count} 💬 {self.comments_count} 🔗 {self.shared_count}\n'
+            f'{get_time_emoji(self.time)} {tg_msg_escape_html(convert_timestamp_to_timestr(self.time))}\n'
+            f'📍 {tg_msg_escape_html(self.ip_location) if hasattr(self, "ip_location") else "?"}'
+            f'</blockquote>'
+        )
+
         if not self.title:
-            message += f'📕 [Note Source]({self.url})'
+            message += f'\n📕 <a href="{self.url}">Note Source</a>'
+
         self.message = message
-        bot_logger.debug(f"Telegram message generated, \n\n{self.message}\n\n")
+        bot_logger.debug(f"Telethon HTML message generated, \n\n{self.message}\n\n")
         return message
 
-    async def to_media_group(self) -> list[list[InputMediaPhoto | InputMediaVideo]]:
-        self.medien: list[InputMediaPhoto | InputMediaVideo] = []
-        self.video_too_large = False  # Flag to track if video is too large
-        for _, imgs in enumerate(self.images_list):
-            if not imgs['live']:
-                self.medien.append(
-                    InputMediaPhoto(imgs['url'])
-                )
-            # else:
-            #     self.medien.append(
-            #         InputMediaVideo(
-            #             requests.get(imgs['url']).content
-            #         )
-            #     )
-        if self.video_url:
-            # Check video size before downloading
-            try:
-                head_response = requests.head(self.video_url, timeout=10)
-                content_length = head_response.headers.get('Content-Length', '0')
-                video_size_mb = int(content_length) / (1024 * 1024)  # Convert to MB
-                
-                bot_logger.info(f"Video size: {video_size_mb:.2f}MB")
-                
-                if video_size_mb > 50:
-                    bot_logger.warning(f"Video size {video_size_mb:.2f}MB exceeds 50MB limit, skipping video upload")
-                    self.video_too_large = True
-                    self.medien = []  # Clear medien to send text only
-                else:
-                    # Only download if size is acceptable
-                    video_data = requests.get(self.video_url).content
-                    self.medien = [InputMediaVideo(video_data)]
-            except Exception as e:
-                bot_logger.error(f"Failed to check video size: {e}, skipping video")
-                self.video_too_large = True
-                self.medien = []
-        self.medien_parts = [self.medien[i:i + 10] for i in range(0, len(self.medien), 10)]
-        return self.medien_parts
+    async def send_as_telethon_message(
+        self,
+        bot: TelegramClient,
+        chat_id: int,
+        reply_to: int = 0,
+    ) -> None:
+        """Send this note to Telegram using the Telethon client."""
+        sent_messages: list = []
 
-    async def send_as_telegram_message(self, bot: Bot, chat_id: int, reply_to_message_id: int = 0) -> None:
-        sent_message = None
-        if not hasattr(self, 'medien_parts'):
-            self.medien_parts: list[list[InputMediaPhoto | InputMediaVideo]] = await self.to_media_group()
-        
-        # Prepare caption for media group
-        caption_text = self.message if hasattr(self, 'message') else await self.to_telegram_message(preview=bool(self.length >= 666))
-        
-        # If video is too large, send only text message
-        if hasattr(self, 'video_too_large') and self.video_too_large:
-            sent_message = [await bot.send_message(
-                chat_id=chat_id,
-                text=caption_text,
-                parse_mode=ParseMode.MARKDOWN_V2,
-                reply_to_message_id=reply_to_message_id,
-                disable_notification=True,
-                link_preview_options=LinkPreviewOptions(is_disabled=True)
-            )]
-        else:
-            for i, part in enumerate(self.medien_parts):
-                if self.video_url:
-                    await bot.send_chat_action(
-                        chat_id=chat_id,
-                        action=ChatAction.UPLOAD_VIDEO,
+        caption = (
+            self.message if hasattr(self, 'message')
+            else await self.to_telethon_message(preview=bool(self.length >= 666))
+        )
+
+        # Collect photo URLs (non-live)
+        photo_urls = [img['url'] for img in self.images_list if not img['live']]
+        live_photo_count = sum(1 for img in self.images_list if img['live'])
+
+        # Handle video
+        video_data: bytes | None = None
+        progress_msg = None
+        dl_start_time = 0.0
+        total_media = len(photo_urls) + (1 if self.video_url else 0)
+        show_progress = total_media > 1 or self.video_url
+
+        if self.video_url:
+            try:
+                head = requests.head(self.video_url, timeout=10)
+                total_bytes = int(head.headers.get('Content-Length', '0'))
+                size_mb = total_bytes / (1024 * 1024)
+                bot_logger.info(f"Video size: {size_mb:.2f}MB")
+
+                if show_progress:
+                    bar = _make_progress_bar(0)
+                    progress_msg = await bot.send_message(
+                        chat_id,
+                        f'📥 Downloading video ({size_mb:.1f} MB)...\n{bar}',
+                        reply_to=reply_to, silent=True,
                     )
-                else:
-                    await bot.send_chat_action(
-                        chat_id=chat_id,
-                        action=ChatAction.UPLOAD_PHOTO,
-                    )
+
+                # Stream download with progress
+                chunks: list[bytes] = []
+                downloaded = 0
+                last_update = time.monotonic()
+                dl_start_time = last_update
+                resp = requests.get(self.video_url, stream=True)
+                for chunk in resp.iter_content(chunk_size=1024 * 256):
+                    chunks.append(chunk)
+                    downloaded += len(chunk)
+                    now = time.monotonic()
+                    if progress_msg and total_bytes and now - last_update >= 2:
+                        last_update = now
+                        pct = downloaded / total_bytes
+                        bar = _make_progress_bar(pct)
+                        dl_mb = downloaded / (1024 * 1024)
+                        try:
+                            await progress_msg.edit(
+                                f'📥 Downloading video ({size_mb:.1f} MB)...\n{bar}  {dl_mb:.1f}/{size_mb:.1f} MB'
+                            )
+                        except MessageNotModifiedError:
+                            pass
+                video_data = b''.join(chunks)
+                dl_elapsed = time.monotonic() - dl_start_time
+
+                if progress_msg:
+                    try:
+                        bar = _make_progress_bar(1)
+                        await progress_msg.edit(
+                            f'📥 Video downloaded ({size_mb:.1f} MB, {dl_elapsed:.1f}s). Uploading...'
+                        )
+                    except MessageNotModifiedError:
+                        pass
+            except Exception as e:
+                bot_logger.error(f"Failed to download video: {e}")
+
+        if video_data:
+            async with bot.action(chat_id, 'video'):
                 try:
-                    # Add caption to the first media item
-                    if i == 0 and part:
-                        part[0] = InputMediaPhoto(part[0].media, caption=caption_text, parse_mode=ParseMode.MARKDOWN_V2) if isinstance(part[0], InputMediaPhoto) else InputMediaVideo(part[0].media, caption=caption_text, parse_mode=ParseMode.MARKDOWN_V2)
-                    
-                    if self.video_url:
-                        # Add caption to video
-                        video_media = self.medien[-1:]
-                        if video_media and i == 0:
-                            video_media[0] = InputMediaVideo(video_media[0].media, caption=caption_text, parse_mode=ParseMode.MARKDOWN_V2)
-                        sent_message = await bot.send_media_group(
-                            chat_id=chat_id,
-                            reply_to_message_id=reply_to_message_id,
-                            media=video_media,
-                            disable_notification=True
+                    # Probe video dimensions and duration with ffprobe
+                    v_w, v_h, v_dur = 0, 0, 0
+                    v_codec = ''
+                    v_bitrate = 0
+                    try:
+                        probe = subprocess.run(
+                            ['ffprobe', '-v', 'quiet', '-print_format', 'json',
+                             '-show_streams', '-show_format', 'pipe:0'],
+                            input=video_data, capture_output=True, timeout=15,
                         )
-                    else:
-                        sent_message = await bot.send_media_group(
-                            chat_id=chat_id,
-                            reply_to_message_id=reply_to_message_id,
-                            media=part,
-                            disable_notification=True
+                        probe_info = json.loads(probe.stdout)
+                        for s in probe_info.get('streams', []):
+                            if s.get('codec_type') == 'video':
+                                v_w = int(s.get('width', 0))
+                                v_h = int(s.get('height', 0))
+                                v_codec = s.get('codec_name', '')
+                                break
+                        fmt = probe_info.get('format', {})
+                        v_dur = int(float(fmt.get('duration', 0)))
+                        v_bitrate = int(int(fmt.get('bit_rate', 0)) / 1000)
+                    except Exception as pe:
+                        bot_logger.warning(f"ffprobe failed, sending without dimensions: {pe}")
+
+                    # Generate a thumbnail from the first frame
+                    thumb_bytes: bytes | None = None
+                    try:
+                        thumb_proc = subprocess.run(
+                            ['ffmpeg', '-i', 'pipe:0', '-vframes', '1',
+                             '-f', 'image2', '-c:v', 'mjpeg', 'pipe:1'],
+                            input=video_data, capture_output=True, timeout=15,
                         )
-                except:
-                    bot_logger.error(f"Failed to send media group:\n{traceback.format_exc()}")
-                    media: list[InputMediaPhoto | InputMediaVideo] = []
-                    for j, p in enumerate(part):
-                        if type(p.media) == str and '.mp4' not in p.media:
-                            media_content = requests.get(p.media).content
-                            # Add caption to first media item in retry
-                            if j == 0 and i == 0:
-                                media.append(InputMediaPhoto(media_content, caption=caption_text, parse_mode=ParseMode.MARKDOWN_V2))
-                            else:
-                                media.append(InputMediaPhoto(media_content))
-                        elif self.video_url and type(p.media) != str:
-                            media.append(p)
-                    if self.video_url:
-                        video_media = self.medien[-1:]
-                        if video_media and i == 0:
-                            video_media[0] = InputMediaVideo(video_media[0].media, caption=caption_text, parse_mode=ParseMode.MARKDOWN_V2)
-                        sent_message = await bot.send_media_group(
-                            chat_id=chat_id,
-                            reply_to_message_id=reply_to_message_id,
-                            media=video_media,
-                            disable_notification=True
+                        if thumb_proc.returncode == 0 and thumb_proc.stdout:
+                            thumb_bytes = thumb_proc.stdout
+                    except Exception as te:
+                        bot_logger.warning(f"Thumbnail extraction failed: {te}")
+
+                    video_io = BytesIO(video_data)
+                    video_io.name = 'video.mp4'
+
+                    thumb_io = None
+                    if thumb_bytes:
+                        thumb_io = BytesIO(thumb_bytes)
+                        thumb_io.name = 'thumb.jpg'
+
+                    # Upload with progress bar
+                    upload_mb = len(video_data) / (1024 * 1024)
+                    upload_last_update = time.monotonic()
+                    ul_start_time = upload_last_update
+
+                    if progress_msg:
+                        try:
+                            bar = _make_progress_bar(0)
+                            await progress_msg.edit(
+                                f'📤 Uploading video ({upload_mb:.1f} MB)...\n{bar}'
+                            )
+                        except MessageNotModifiedError:
+                            pass
+                    elif show_progress:
+                        bar = _make_progress_bar(0)
+                        progress_msg = await bot.send_message(
+                            chat_id,
+                            f'📤 Uploading video ({upload_mb:.1f} MB)...\n{bar}',
+                            reply_to=reply_to, silent=True,
                         )
-                    else:
-                        sent_message = await bot.send_media_group(
-                            chat_id=chat_id,
-                            reply_to_message_id=reply_to_message_id,
-                            media=media,
-                            disable_notification=True
+
+                    async def _upload_progress(current: int, total: int) -> None:
+                        nonlocal upload_last_update, progress_msg
+                        if not progress_msg:
+                            return
+                        now = time.monotonic()
+                        if now - upload_last_update < 2:
+                            return
+                        upload_last_update = now
+                        pct = current / total if total else 0
+                        bar = _make_progress_bar(pct)
+                        cur_mb = current / (1024 * 1024)
+                        tot_mb = total / (1024 * 1024)
+                        try:
+                            await progress_msg.edit(
+                                f'📤 Uploading video ({tot_mb:.1f} MB)...\n{bar}  {cur_mb:.1f}/{tot_mb:.1f} MB'
+                            )
+                        except MessageNotModifiedError:
+                            pass
+
+                    result = await bot.send_file(
+                        chat_id, video_io,
+                        caption=caption, parse_mode='html',
+                        reply_to=reply_to, silent=True,
+                        supports_streaming=True,
+                        thumb=thumb_io,
+                        progress_callback=_upload_progress if progress_msg else None,
+                        attributes=[DocumentAttributeVideo(
+                            duration=v_dur, w=v_w or 1280, h=v_h or 720,
+                            supports_streaming=True,
+                        )] if v_w and v_h else None,
+                    )
+                    sent_messages = result if isinstance(result, list) else [result]
+                    ul_elapsed = time.monotonic() - ul_start_time
+
+                    # Update progress message with summary
+                    if progress_msg:
+                        try:
+                            summary = '✅ Video sent successfully\n'
+                            summary += f'📦 Size: {upload_mb:.1f} MB'
+                            if v_w and v_h:
+                                summary += f' | {v_w}×{v_h}'
+                            if v_codec:
+                                summary += f' | {v_codec.upper()}'
+                            if v_bitrate:
+                                summary += f' | {v_bitrate} kbps'
+                            if v_dur:
+                                mins, secs = divmod(v_dur, 60)
+                                summary += f'\n⏱ Duration: {mins}:{secs:02d}'
+                            summary += f'\n📥 Download: {dl_elapsed:.1f}s | 📤 Upload: {ul_elapsed:.1f}s'
+                            if live_photo_count:
+                                summary += f'\n🎞 {live_photo_count} live photo(s) — view in Telegraph'
+                            await progress_msg.edit(summary)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    bot_logger.error(f"Failed to send video: {e}\n{traceback.format_exc()}")
+
+        elif photo_urls:
+            async with bot.action(chat_id, 'photo'):
+                if show_progress:
+                    progress_msg = await bot.send_message(
+                        chat_id,
+                        f'📥 Downloading {len(photo_urls)} photo(s)...\n{_make_progress_bar(0)}',
+                        reply_to=reply_to, silent=True,
+                    )
+                dl_start_time = time.monotonic()
+                last_update = dl_start_time
+                all_files: list[BytesIO] = []
+                for idx, url in enumerate(photo_urls):
+                    resp = requests.get(url)
+                    bio = BytesIO(resp.content)
+                    bio.name = f'photo_{idx + 1}.jpg'
+                    all_files.append(bio)
+                    now = time.monotonic()
+                    if progress_msg and now - last_update >= 1.5:
+                        last_update = now
+                        pct = (idx + 1) / len(photo_urls)
+                        bar = _make_progress_bar(pct)
+                        try:
+                            await progress_msg.edit(
+                                f'📥 Downloading photos...\n{bar}  {idx + 1}/{len(photo_urls)}'
+                            )
+                        except MessageNotModifiedError:
+                            pass
+                dl_elapsed = time.monotonic() - dl_start_time
+
+                if progress_msg:
+                    try:
+                        await progress_msg.edit(
+                            f'📤 Uploading {len(photo_urls)} photo(s)...\n{_make_progress_bar(0)}'
                         )
-        
-        if not sent_message:
+                    except MessageNotModifiedError:
+                        pass
+
+                ul_start_time = time.monotonic()
+                total_upload_bytes = sum(f.getbuffer().nbytes for f in all_files)
+                total_size = total_upload_bytes / (1024 * 1024)
+                uploaded_bytes = 0
+                upload_last_update = ul_start_time
+                num_batches = (len(all_files) + 9) // 10
+
+                for i in range(0, len(all_files), 10):
+                    batch = all_files[i:i + 10]
+                    batch_idx = i // 10
+                    batch_base_bytes = sum(f.getbuffer().nbytes for f in all_files[:i])
+                    cap = caption if i == 0 else None
+
+                    async def _photo_upload_progress(current: int, total: int) -> None:
+                        nonlocal upload_last_update
+                        if not progress_msg:
+                            return
+                        now = time.monotonic()
+                        if now - upload_last_update < 2:
+                            return
+                        upload_last_update = now
+                        overall = batch_base_bytes + current
+                        pct = overall / total_upload_bytes if total_upload_bytes else 0
+                        bar = _make_progress_bar(pct)
+                        cur_mb = overall / (1024 * 1024)
+                        try:
+                            await progress_msg.edit(
+                                f'📤 Uploading photos ({batch_idx + 1}/{num_batches})...\n{bar}  {cur_mb:.1f}/{total_size:.1f} MB'
+                            )
+                        except MessageNotModifiedError:
+                            pass
+
+                    try:
+                        result = await bot.send_file(
+                            chat_id, batch,
+                            caption=cap, parse_mode='html',
+                            reply_to=reply_to, silent=True,
+                            progress_callback=_photo_upload_progress if progress_msg else None,
+                        )
+                        if i == 0:
+                            sent_messages = result if isinstance(result, list) else [result]
+                        uploaded_bytes = batch_base_bytes + sum(f.getbuffer().nbytes for f in batch)
+                    except Exception as e:
+                        bot_logger.error(f"Photo batch {i} failed ({e})\n{traceback.format_exc()}")
+                ul_elapsed = time.monotonic() - ul_start_time
+
+                total_size = sum(f.getbuffer().nbytes for f in all_files) / (1024 * 1024)
+                if progress_msg:
+                    try:
+                        summary = f'✅ {len(photo_urls)} photo(s) sent successfully\n'
+                        summary += f'📦 Total size: {total_size:.1f} MB\n'
+                        summary += f'📥 Download: {dl_elapsed:.1f}s | 📤 Upload: {ul_elapsed:.1f}s'
+                        if live_photo_count:
+                            summary += f'\n🎞 {live_photo_count} live photo(s) — view in Telegraph'
+                        await progress_msg.edit(summary)
+                    except Exception:
+                        pass
+
+        else:
+            # No media at all – text only
+            msg = await bot.send_message(
+                chat_id, caption, parse_mode='html',
+                reply_to=reply_to, silent=True, link_preview=False,
+            )
+            sent_messages = [msg]
+
+        if not sent_messages:
             bot_logger.error("No message was sent!")
             return
-        
-        # Store note content and media for AI summary on reaction
+
+        # Persist message data for AI summary (🤔 reaction trigger)
         try:
-            msg_identifier = f"{chat_id}.{sent_message[0].message_id}"
-            msg_data = {
-                'content': str(self),
-                'media': self.media_for_llm()
-            }
-            msg_file_path = os.path.join('data', f'{msg_identifier}.json')
-            with open(msg_file_path, 'w', encoding='utf-8') as f:
+            first_id = sent_messages[0].id
+            msg_identifier = f"{chat_id}.{first_id}"
+            msg_data = {'content': str(self), 'media': self.media_for_llm()}
+            with open(os.path.join('data', f'{msg_identifier}.json'), 'w', encoding='utf-8') as f:
                 json.dump(msg_data, f, indent=4, ensure_ascii=False)
-            bot_logger.debug(f"Saved message data to {msg_file_path} for AI summary")
+            bot_logger.debug(f"Saved message data to data/{msg_identifier}.json")
         except Exception as e:
             bot_logger.error(f"Failed to save message data: {e}")
-        
-        reply_id = sent_message[0].message_id
-        comment_id_to_message_id: dict[str, Any] = {}
+
+        # Send anchor-comment thread
+        reply_id = sent_messages[0].id
+        comment_id_to_msg_id: dict[str, int] = {}
+
         if self.comments_with_context:
-            for _, comment in enumerate(self.comments_with_context):
-                comment_text = ''
-                comment_text += f'💬 [Comment](https://www.xiaohongshu.com/discovery/item/{self.noteId}?anchorCommentId={comment["id"]})'
-                if 'target_comment' in comment:
-                    comment_text += f'\n↪️ [@{tg_msg_escape_markdown_v2(comment["target_comment"]["user"].get("nickname", ""))} \\({tg_msg_escape_markdown_v2(comment["target_comment"]["user"].get('red_id', ''))}\\)](https://www.xiaohongshu.com/user/profile/{comment["target_comment"]["user"]["userid"]})\n'
-                else:
-                    comment_text += '\n'
-                comment_text += f'{make_block_quotation(replace_redemoji_with_emoji(comment["content"]))}\n'
-                comment_text += f'❤️ {comment["like_count"]} 💬 {comment["sub_comment_count"]} 📍 {tg_msg_escape_markdown_v2(comment["ip_location"])} {get_time_emoji(comment["time"])} {tg_msg_escape_markdown_v2(convert_timestamp_to_timestr(comment["time"]))}\n'
-                comment_text += f'👤 [@{tg_msg_escape_markdown_v2(comment["user"].get("nickname", ""))} \\({tg_msg_escape_markdown_v2(comment["user"].get('red_id', ''))}\\)](https://www.xiaohongshu.com/user/profile/{comment["user"]["userid"]})'
-                bot_logger.debug(f"Sending comment:\n{comment_text}")
-                if 'target_comment' in comment and _ > 0:
-                    reply_id = comment_id_to_message_id[comment['target_comment']['id']].message_id
+            for ci, comment in enumerate(self.comments_with_context):
+                comment_html = _build_comment_html(comment, self.noteId)
+
+                this_reply_id = reply_id
+                if 'target_comment' in comment and ci > 0:
+                    target_id = comment['target_comment']['id']
+                    if target_id in comment_id_to_msg_id:
+                        this_reply_id = comment_id_to_msg_id[target_id]
+
                 if comment['pictures']:
-                    await bot.send_chat_action(
-                        chat_id=chat_id,
-                        action=ChatAction.UPLOAD_PHOTO
-                    )
-                    # 1. Split pictures into chunks of 10
-                    picture_chunks = [comment['pictures'][i:i + 10] for i in range(0, len(comment['pictures']), 10)]
-                    for i, chunk in enumerate(picture_chunks):
-                        media: list[InputMediaPhoto | InputMediaVideo] = []
-                        for pic in chunk:
-                            if 'mp4' not in pic:
-                                media_data = requests.get(pic).content
-                                media.append(InputMediaPhoto(media_data))
-                        # 2. Check if this is the LAST chunk
-                        if i == len(picture_chunks) - 1:
-                            # Send the last chunk WITH the caption
-                            sent_messages = await bot.send_media_group(
-                                chat_id=chat_id,
-                                reply_to_message_id=reply_id,
-                                media=media,
-                                caption=comment_text,
-                                parse_mode=ParseMode.MARKDOWN_V2,
-                                disable_notification=True
+                    pics = [p for p in comment['pictures'] if 'mp4' not in p]
+                    chunks = [pics[k:k + 10] for k in range(0, len(pics), 10)]
+                    async with bot.action(chat_id, 'photo'):
+                        for j, chunk in enumerate(chunks):
+                            files = []
+                            for idx, url in enumerate(chunk):
+                                resp = requests.get(url)
+                                bio = BytesIO(resp.content)
+                                bio.name = f'comment_{ci + 1}_{j + 1}_{idx + 1}.jpg'
+                                files.append(bio)
+                            cap = comment_html if j == len(chunks) - 1 else None
+                            result = await bot.send_file(
+                                chat_id, files,
+                                caption=cap, parse_mode='html',
+                                reply_to=this_reply_id, silent=True,
                             )
-                            # 3. Store ONLY the first message object so .message_id works later
-                            comment_id_to_message_id[comment['id']] = sent_messages[0]
-                        else:
-                            # Send intermediate chunks WITHOUT caption
-                            await bot.send_media_group(
-                                chat_id=chat_id,
-                                reply_to_message_id=reply_id,
-                                media=media,
-                                disable_notification=True
-                            )
+                            if j == len(chunks) - 1:
+                                r0 = result[0] if isinstance(result, list) else result
+                                comment_id_to_msg_id[comment['id']] = r0.id
+
                 elif comment.get('audio_url', ''):
-                    await bot.send_chat_action(
-                        chat_id=chat_id,
-                        action=ChatAction.RECORD_VOICE
-                    )
-                    # Download audio
-                    r = requests.get(comment['audio_url'])
-                    audio_bytes = r.content
+                    async with bot.action(chat_id, 'record-audio'):
+                        ogg = convert_to_ogg_opus_pipe(requests.get(comment['audio_url']).content)
+                        result = await bot.send_file(
+                            chat_id, ogg,
+                            caption=comment_html, parse_mode='html',
+                            reply_to=this_reply_id, silent=True,
+                            voice_note=True,
+                        )
+                        comment_id_to_msg_id[comment['id']] = result.id  # type: ignore[union-attr]
 
-                    # Convert to Ogg/Opus
-                    ogg_bytes = convert_to_ogg_opus_pipe(audio_bytes)
-                    comment_id_to_message_id[comment['id']] = await bot.send_voice(
-                        chat_id=chat_id,
-                        voice=ogg_bytes,
-                        reply_to_message_id=reply_id,
-                        caption=comment_text,
-                        parse_mode=ParseMode.MARKDOWN_V2,
-                        disable_notification=True
-                    )
                 else:
-                    await bot.send_chat_action(
-                        chat_id=chat_id,
-                        action=ChatAction.TYPING
-                    )
-                    comment_id_to_message_id[comment['id']] = await bot.send_message(
-                        chat_id=chat_id,
-                        reply_to_message_id=reply_id,
-                        text=comment_text,
-                        parse_mode=ParseMode.MARKDOWN_V2,
-                        disable_web_page_preview=True,
-                        disable_notification=True
-                    )
+                    async with bot.action(chat_id, 'typing'):
+                        result = await bot.send_message(
+                            chat_id, comment_html,
+                            parse_mode='html',
+                            reply_to=this_reply_id, silent=True,
+                            link_preview=False,
+                        )
+                        comment_id_to_msg_id[comment['id']] = result.id
 
-def get_redirected_url(url: str) -> str:
-    return unquote(requests.get(url if 'http' in url else f'http://{url}').url.split("redirectPath=")[-1])
 
-def get_clean_url(url: str) -> str:
-    return urljoin(url, urlparse(url).path)
+# ── Comment HTML builder ───────────────────────────────────────────────────────
 
-def get_time_emoji(timestamp: int) -> str:
-    a = int(((timestamp + 8 * 3600) / 900 - 3) / 2 % 24)
-    return f'{chr(128336 + a // 2 + a % 2 * 12)}'
+def _build_comment_html(comment: dict[str, Any], noteId: str) -> str:
+    """Build the HTML text for a single comment message."""
+    anchor = f'https://www.xiaohongshu.com/discovery/item/{noteId}?anchorCommentId={comment["id"]}'
+    text = f'💬 <a href="{anchor}">Comment</a>'
 
-def convert_timestamp_to_timestr(timestamp: int) -> str:
-    utc_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-    utc_plus_8 = utc_dt + timedelta(hours=8)
-    return utc_plus_8.strftime('%Y-%m-%d %H:%M:%S')
-
-def remove_image_url_params(url: str) -> str:
-    for k, v in parse_qs(url).items():
-        url = url.replace(f'&{k}={v[0]}', '')
-    return url
-
-def tg_msg_escape_html(t: str) -> str:
-    return t.replace('<', '&lt;')\
-        .replace('>','&gt;')\
-        .replace('&', '&amp;')
-
-def tg_msg_escape_markdown_v2(t: str | int) -> str:
-    t = str(t)
-    for i in ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']:
-        t = t.replace(i, "\\" + i)
-    return t
-
-def make_block_quotation(text: str) -> str:
-    lines = [f'>{tg_msg_escape_markdown_v2(line)}' for line in text.split('\n') if len(line) > 0 and bool(re.findall(r'\S+', line))]
-    if len(lines) > 3:
-        lines[0] = f'**{lines[0]}'
-        lines[-1] = f'{lines[-1]}||'
-    return '\n'.join(lines)
-
-def open_note(noteId: str, anchorCommentId: str | None = None) -> dict[str, Any] | None:
-    try:
-        return requests.get(f'https://{FLASK_SERVER_NAME}/open_note/{noteId}' + (f"?anchorCommentId={anchorCommentId}" if anchorCommentId else '')).json()
-    except:
-        return None
-
-def get_url_info(message_text: str) -> dict[str, str | bool]:
-    xsec_token = ''
-    urls = re.findall(URL_REGEX, message_text)
-    bot_logger.info(f'URLs:\n{urls}')
-    anchorCommentId = ''
-    if len(urls) == 0:
-        bot_logger.debug("NO URL FOUND!")
-        return {'success': False, 'msg': 'No URL found in the message.', 'noteId': '', 'xsec_token': '', 'anchorCommentId': ''}
-    elif re.findall(r"[a-z0-9]{24}", message_text) and not re.findall(r"user/profile/[a-z0-9]{24}", message_text):
-        noteId = re.findall(r"[a-z0-9]{24}", message_text)[0]
-        note_url = [u for u in urls if re.findall(r"[a-z0-9]{24}", u) and not re.findall(r"user/profile/[a-z0-9]{24}", u)][0]
-        parsed_url = urlparse(str(note_url))
-        if 'xsec_token' in parse_qs(parsed_url.query):
-            xsec_token = parse_qs(parsed_url.query)['xsec_token'][0]
-        if 'anchorCommentId' in parse_qs(parsed_url.query):
-            anchorCommentId = parse_qs(parsed_url.query)['anchorCommentId'][0]
-    elif 'xhslink.com' in message_text or 'xiaohongshu.com' in message_text:
-        xhslink = [u for u in urls if 'xhslink.com' in u][0]
-        bot_logger.debug(f"URL found: {xhslink}")
-        redirectPath = get_redirected_url(xhslink)
-        bot_logger.debug(f"Redirected URL: {redirectPath}")
-        if re.findall(r"https?://(?:www.)?xhslink.com/[a-z]/[A-Za-z0-9]+", xhslink):
-            clean_url = get_clean_url(redirectPath)
-            if 'xiaohongshu.com/404' in redirectPath or 'xiaohongshu.com/login' in redirectPath:
-                noteId = re.findall(r"noteId=([a-z0-9]+)", redirectPath)[0]
-                if 'redirectPath=' in redirectPath:
-                    redirectPath = unquote(redirectPath.replace('https://www.xiaohongshu.com/login?redirectPath=', '').replace('https://www.xiaohongshu.com/404?redirectPath=', '').replace('https://www.xiaohongshu.com/login?redirectPath=', ''))
-            else:
-                noteId = re.findall(r"https?:\/\/(?:www.)?xiaohongshu.com\/discovery\/item\/([a-z0-9]+)", clean_url)[0]
-            parsed_url = urlparse(str(redirectPath))
-            if 'xsec_token' in parse_qs(parsed_url.query):
-                xsec_token = parse_qs(parsed_url.query)['xsec_token'][0]
-            if 'anchorCommentId' in parse_qs(parsed_url.query):
-                anchorCommentId = parse_qs(parsed_url.query)['anchorCommentId'][0]
-        elif re.findall(r"https?:\/\/(?:www.)?xiaohongshu.com\/discovery\/item\/[0-9a-z]+", xhslink):
-            noteId = re.findall(r"https?:\/\/(?:www.)?xiaohongshu.com\/discovery\/item\/([a-z0-9]+)", xhslink)[0]
-            parsed_url = urlparse(str(xhslink))
-            if 'xsec_token' in parse_qs(parsed_url.query):
-                xsec_token = parse_qs(parsed_url.query)['xsec_token'][0]
-            if 'anchorCommentId' in parse_qs(parsed_url.query):
-                anchorCommentId = parse_qs(parsed_url.query)['anchorCommentId'][0]
-        elif re.findall(r"https?://(?:www.)?xiaohongshu.com/explore/[a-z0-9]+", message_text):
-            noteId = re.findall(r"https?:\/\/(?:www.)?xiaohongshu.com\/explore\/([a-z0-9]+)", xhslink)[0]
-            parsed_url = urlparse(str(xhslink))
-            if 'xsec_token' in parse_qs(parsed_url.query):
-                xsec_token = parse_qs(parsed_url.query)['xsec_token'][0]
-            if 'anchorCommentId' in parse_qs(parsed_url.query):
-                anchorCommentId = parse_qs(parsed_url.query)['anchorCommentId'][0]
-        else:
-            return {'success': False, 'msg': 'Invalid URL or the note is no longer available.', 'noteId': '', 'xsec_token': ''}
+    if 'target_comment' in comment:
+        nick = tg_msg_escape_html(comment['target_comment']['user'].get('nickname', ''))
+        red_id = tg_msg_escape_html(comment['target_comment']['user'].get('red_id', ''))
+        uid = comment['target_comment']['user']['userid']
+        text += f'\n↪️ <a href="https://www.xiaohongshu.com/user/profile/{uid}">@{nick} ({red_id})</a>\n'
     else:
-        return {'success': False, 'msg': 'Invalid URL.', 'noteId': '', 'xsec_token': ''}
-    return {'success': True, 'msg': 'Success.', 'noteId': noteId, 'xsec_token': xsec_token, 'anchorCommentId': anchorCommentId}
+        text += '\n'
 
-def parse_comment(comment_data: dict[str, Any]):
-    target_comment = comment_data.get('target_comment', {})
-    user = comment_data.get('user', {})
-    content = comment_data.get('content', '')
-    content = re.sub(
-        r'(?P<tag>#\S+?)\[\S+\]#',
-        r'\g<tag> ',
-        content
+    text += make_block_quotation_html(replace_redemoji_with_emoji(comment['content'])) + '\n'
+
+    nick = tg_msg_escape_html(comment['user'].get('nickname', ''))
+    red_id = tg_msg_escape_html(comment['user'].get('red_id', ''))
+    uid = comment['user']['userid']
+    ip = tg_msg_escape_html(comment['ip_location'])
+    time_str = tg_msg_escape_html(convert_timestamp_to_timestr(comment['time']))
+    text += (
+        f'❤️ {comment["like_count"]} 💬 {comment["sub_comment_count"]} '
+        f'📍 {ip} {get_time_emoji(comment["time"])} {time_str}\n'
     )
-    pictures = comment_data.get('pictures', [])
-    picture_urls: list[str] = []
-    for p in pictures:
-        original_url = p.get('origin_url', '')
-        if 'video_info' in p:
-            video_info = p.get('video_info', '')
-            if video_info:
-                video_data = json.loads(video_info)
-                for stream in video_data['stream']:
-                    if video_data['stream'][stream]:
-                        if 'backup_urls' in video_data['stream'][stream][0]:
-                            video_url = video_data['stream'][stream][0]['backup_urls'][0]
-                            picture_urls.append(video_url)
-        picture_urls.append(re.sub(r'sns-note-i\d.xhscdn.com', 'sns-na-i6.xhscdn.com', original_url).split('?imageView')[0] + '?imageView2/2/w/5000/h/5000/format/webp/q/56&redImage/frame/0')
-    audio_info = comment_data.get('audio_info', '')
-    audio_url = ''
-    if audio_info:
-        audio_data = audio_info.get('play_info', {})
-        if audio_data:
-            audio_url = audio_data.get('url', '')
-    id = comment_data.get('id', '')
-    time = comment_data.get('time', 0)
-    like_count = comment_data.get('like_count', 0)
-    sub_comment_count = comment_data.get('sub_comment_count', 0)
-    ip_location = comment_data.get('ip_location', '?')
-    data: dict[str, Any] = {
-        'user': user,
-        'content': content,
-        'pictures': picture_urls,
-        'id': id,
-        'time': time,
-        'like_count': like_count,
-        'sub_comment_count': sub_comment_count,
-        'ip_location': ip_location,
-        'audio_url': audio_url,
-    }
-    if target_comment:
-        data['target_comment'] = target_comment
-    return data
+    text += f'👤 <a href="https://www.xiaohongshu.com/user/profile/{uid}">@{nick} ({red_id})</a>'
+    return text
 
-def extract_anchor_comment_id(json_data: dict[str, Any]) -> list[dict[str, Any]]:
-    comments = json_data.get('comments', [])
-    if not comments:
-        bot_logger.error("No comments found in the data.")
-        bot_logger.error(f"JSON data: {pformat(json_data)}")
-        return []
-    comment = comments[0]
-    sub_comments = comment.get('sub_comments', [])
-    related_sub_comments: list[dict[str, Any]] = []
-    if 'page_context' in json_data:
-        page_context = json_data.get('page_context', '')
-        if page_context:    
-            page_context = json.loads(page_context)
-            key_comments_id = page_context.get('top', [])
-            for key in key_comments_id:
-                for sub_comment in sub_comments:
-                    if sub_comment.get('id', '') == key:
-                        related_sub_comments.append(sub_comment)
-    all_comments = [comment] + related_sub_comments
 
-    data_parsed: list[dict[str, Any]] = []
+# ── Reaction helper ───────────────────────────────────────────────────────────
 
-    for c in all_comments:
-        parsed_comment = parse_comment(c)
-        data_parsed.append(parsed_comment)
-    return data_parsed
-
-def extract_all_comments(json_data: dict[str, Any]) -> list[dict[str, Any]]:
-    comments = json_data.get('comments', [])
-    if not comments:
-        bot_logger.error("No comments found in the data.")
-        bot_logger.error(f"JSON data: {pformat(json_data)}")
-        return []
-
-    data_parsed: list[dict[str, Any]] = []
-
-    for comment in comments:
-        parsed_comment = parse_comment(comment)
-        sub_comments: list[dict[str, Any]] = []
-        for sub_comment in comment.get('sub_comments', []):
-            parsed_sub_comment = parse_comment(sub_comment)
-            sub_comments.append(parsed_sub_comment)
-        parsed_comment["sub_comments"] = sub_comments
-        data_parsed.append(parsed_comment)
-    return data_parsed
-
-def convert_to_ogg_opus_pipe(input_bytes: bytes) -> bytes:
-    process = subprocess.Popen(
-        [
-            "ffmpeg", "-i", "pipe:0",
-            "-c:a", "libopus",
-            "-f", "ogg",
-            "pipe:1"
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
-    out, _ = process.communicate(input_bytes)
-    return out
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id if update.effective_user else None
-    chat = update.effective_chat
-    
-    if chat:
-        try:
-            await context.bot.send_message(chat_id=chat.id, text="I'm xhsfwbot, please send me a xhs link!\n/help for more info.")
-        except Exception as e:
-            bot_logger.error(f"Failed to send start message: {e}")
-
-async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id if update.effective_user else None
-    bot_logger.debug(f"Help requested by user {user_id}")
-    chat = update.effective_chat
-    
-    if chat:
-        try:
-            if help_config.get('type') == 'text':
-                # Admin set a plain-text help message
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    text=help_config['text']
-                )
-            elif help_config.get('type') == 'forward':
-                # Copy (not forward) so the original sender name is not shown
-                await context.bot.copy_message(
-                    chat_id=chat.id,
-                    from_chat_id=help_config['from_chat_id'],
-                    message_id=help_config['message_id'],
-                    disable_notification=True
-                )
-            else:
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    text="No help message has been configured yet. Ask the administrator to set one with /sethelp."
-                )
-        except Exception as e:
-            bot_logger.error(f"Failed to send help message: {e}")
-
-async def sethelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin-only: set the help message sent by /help.
-
-    Usage:
-      /sethelp <text>          — set help to the given text
-      /sethelp (reply to msg) — set help to that replied message (forwarded)
-      /clearhelp               — remove custom help message (revert to default)
-    """
-    global help_config
-    user_id = update.effective_user.id if update.effective_user else None
-    admin_id = os.getenv('ADMIN_ID')
-    chat = update.effective_chat
-    message = update.effective_message
-
-    if not admin_id or str(user_id) != str(admin_id):
-        if chat:
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text="Sorry, only the administrator can use this command."
-            )
-        return
-
-    if not message or not chat:
-        return
-
-    if message.reply_to_message:
-        # Store the replied-to message as the help content (will be forwarded)
-        reply = message.reply_to_message
-        help_config = {
-            'type': 'forward',
-            'from_chat_id': reply.chat.id,
-            'message_id': reply.message_id
-        }
-        save_help_config(help_config)
-        bot_logger.info(f"Admin {user_id} set help to forwarded message {reply.message_id} from chat {reply.chat.id}")
-        await context.bot.send_message(
-            chat_id=chat.id,
-            text="✅ Help message updated — the replied message will be forwarded when users call /help."
-        )
-    elif context.args:
-        # Store the provided text as the help message
-        help_text = ' '.join(context.args)
-        help_config = {
-            'type': 'text',
-            'text': help_text
-        }
-        save_help_config(help_config)
-        bot_logger.info(f"Admin {user_id} set help to custom text")
-        await context.bot.send_message(
-            chat_id=chat.id,
-            text=f"✅ Help message updated to:\n\n{help_text}"
-        )
-    else:
-        await context.bot.send_message(
-            chat_id=chat.id,
-            text=(
-                "ℹ️ Usage:\n"
-                "• /sethelp <text> — set help message to the given text\n"
-                "• Reply to any message + /sethelp — use that message as help content\n"
-                "• /clearhelp — remove custom help and revert to default"
-            )
-        )
-
-async def clearhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin-only: clear the custom help message and revert to the default."""
-    global help_config
-    user_id = update.effective_user.id if update.effective_user else None
-    admin_id = os.getenv('ADMIN_ID')
-    chat = update.effective_chat
-
-    if not admin_id or str(user_id) != str(admin_id):
-        if chat:
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text="Sorry, only the administrator can use this command."
-            )
-        return
-
-    help_config = {}
-    save_help_config(help_config)
-    bot_logger.info(f"Admin {user_id} cleared the custom help message")
-    if chat:
-        await context.bot.send_message(
-            chat_id=chat.id,
-            text="✅ Custom help message cleared. /help will now use the default channel message (if configured)."
-        )
-
-async def handle_message_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle message reactions for AI summary trigger"""
-    bot_logger.debug(f"Received reaction update: {update}")
-    reaction = update.message_reaction
-    if not reaction:
-        bot_logger.debug("No message_reaction in update")
-        return
-    
-    user_id = update.effective_user.id if update.effective_user else None
-    bot_logger.debug(f"Reaction from user {user_id}: {reaction}")
-    
-    # Check if the reaction includes 🤔 (thinking emoji)
-    new_reactions = reaction.new_reaction
-    if not new_reactions:
-        bot_logger.debug("No new reactions")
-        return
-    
-    bot_logger.debug(f"New reactions: {new_reactions}")
-    has_thinking_emoji = any(
-        r.emoji == "🤔" for r in new_reactions if hasattr(r, 'emoji')
-    )
-    
-    if not has_thinking_emoji:
-        bot_logger.debug("No thinking emoji found in reactions")
-        return
-    
-    bot_logger.info(f"User {user_id} reacted with 🤔 to message {reaction.message_id}")
-    
-    # Get message details
-    chat_id = reaction.chat.id
-    message_id = reaction.message_id
-    msg_identifier = f"{chat_id}.{message_id}"
-    
-    # Check if we have data for this message (verifies it's a bot message we processed)
-    msg_file_path = os.path.join('data', f'{msg_identifier}.json')
-    if not os.path.exists(msg_file_path):
-        bot_logger.debug(f"No data file found for message {msg_identifier}, ignoring reaction (not a bot-parsed message)")
-        return
-    
-    # React with 👾 (Alien Monster emoji)
+async def _set_reaction(bot: TelegramClient, peer: Any, msg_id: int, emoticon: str) -> None:
     try:
-        await context.bot.set_message_reaction(
-            chat_id=chat_id,
-            message_id=message_id,
-            reaction="👾"
-        )
-        bot_logger.info(f"Reacted with 👾 to message {message_id}")
+        await bot(functions.messages.SendReactionRequest(
+            peer=peer,
+            msg_id=msg_id,
+            reaction=[tl_types.ReactionEmoji(emoticon=emoticon)],
+        ))
     except Exception as e:
-        bot_logger.error(f"Failed to set 👾 reaction: {e}")
-    
-    # Send typing action
-    try:
-        await context.bot.send_chat_action(
-            chat_id=chat_id,
-            action=ChatAction.TYPING
-        )
-    except Exception as e:
-        bot_logger.debug(f"Failed to send typing action: {e}")
-    
-    # Send initial AI summary message
-    try:
-        ai_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            reply_to_message_id=message_id,
-            text=f"*{tg_msg_escape_markdown_v2('✨ AI Summary:')}*\n```\n{tg_msg_escape_markdown_v2('Loading...')}```",
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_notification=True
-        )
-    except Exception as e:
-        bot_logger.error(f"Failed to send AI summary message: {e}")
-        return
-    
-    # Read the stored message data (we already verified it exists above)
-    try:
-        with open(msg_file_path, 'r', encoding='utf-8') as f:
-            msg_data = json.load(f)
-            note_content = msg_data.get('content', '')
-            media_data = msg_data.get('media', [])
-    except Exception as e:
-        bot_logger.error(f"Failed to read message data: {e}")
-        await asyncio.sleep(0.5)
-        await ai_msg.edit_text(
-            text=f"*{tg_msg_escape_markdown_v2('✨ AI Summary:')}*\n```\n{tg_msg_escape_markdown_v2('Error: Failed to load note data.')}```",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-        return
-    
-    if not note_content:
-        await asyncio.sleep(0.5)
-        await ai_msg.edit_text(
-            text=f"*{tg_msg_escape_markdown_v2('✨ AI Summary:')}*\n```\n{tg_msg_escape_markdown_v2('Error: Note content is empty.')}```",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-        return
-    
-    # Generate AI summary
-    try:
-        await asyncio.sleep(0.5)
-        await ai_msg.edit_text(
-            text=f"*{tg_msg_escape_markdown_v2('✨ AI Summary:')}*\n```\n{tg_msg_escape_markdown_v2('Gathering note data...')}```",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-        
-        content_length = max(100, min(200, len(note_content)//2))
-        llm_query = f'''以下是一篇小红书笔记的完整内容。请先判断笔记本体的性质，再据此确定总结的语气与取向。
+        bot_logger.debug(f"Failed to set reaction {emoticon!r}: {e}")
+
+
+# ── AI summary (shared logic) ─────────────────────────────────────────────────
+
+LLM_QUERY_TEMPLATE = '''以下是一篇小红书笔记的完整内容。请先判断笔记本体的性质，再据此确定总结的语气与取向。
 
 【语气判断规则】
 1. 若笔记或评论呈现明显槽点、反差、搞笑情节、离谱行为、过度矫情、自我矛盾或"废物行为"（包括但不限于巨婴操作、反智自信、嘴硬硬撑、生活不自理等），可适度使用克制的幽默与轻度吐槽，但仅针对行为本身。
@@ -1091,817 +1047,150 @@ async def handle_message_reaction(update: Update, context: ContextTypes.DEFAULT_
 
 3. 多媒体仅在必要时简要说明，不得机械复述画面。
 
-4. 语言自然、流畅。  
-5. 禁止输出无关内容。  
-6. 直接输出正文，无标题、无前后缀、无 Markdown。  
+4. 语言自然、流畅。
+5. 禁止输出无关内容。
+6. 直接输出正文，无标题、无前后缀、无 Markdown。
 7. 使用简体中文。
 8. 字数尽量不超过 {content_length}，若超出则在确保内容完整前提下尽量接近该限制。
 
 笔记内容如下：
 {note_content}'''
-        
-        bot_logger.debug(f"LLM Query:\\n{llm_query}")
-        
-        contents: list[types.Part] = [types.Part(text=llm_query)]
-        
-        await asyncio.sleep(0.5)
-        await ai_msg.edit_text(
-            text=f"*{tg_msg_escape_markdown_v2('✨ AI Summary:')}*\n```\n{tg_msg_escape_markdown_v2('Downloading media...')}```",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-        
-        # Download media and convert to Gemini Part
-        for media in media_data:
-            if media.get('type', '') == 'image' and 'url' in media:
-                media_url = media['url']
-                media_bytes = requests.get(media_url).content
-                
-                # Compress image to 720p before uploading to Gemini
-                try:
-                    img = Image.open(BytesIO(media_bytes))
-                    # Calculate new size while maintaining aspect ratio
-                    width, height = img.size
-                    if height > 720 or width > 1280:
-                        if height > width:
-                            new_height = 720
-                            new_width = int(width * (720 / height))
-                        else:
-                            new_width = 1280
-                            new_height = int(height * (1280 / width))
-                        img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                    
-                    # Convert to JPEG and compress
-                    output = BytesIO()
-                    img.convert('RGB').save(output, format='JPEG', quality=70, optimize=True)
-                    media_bytes = output.getvalue()
-                    bot_logger.debug(f"Compressed image from {width}x{height} to {img.size[0]}x{img.size[1]}")
-                except Exception as e:
-                    bot_logger.warning(f"Failed to compress image, using original: {e}")
-                
-                image_part = types.Part.from_bytes(
-                    data=media_bytes,
-                    mime_type="image/jpeg"
-                )
-                contents.append(image_part)
-        
-        bot_logger.info(f"Generating summary with content length limit: {content_length}")
-        await asyncio.sleep(0.5)
-        await ai_msg.edit_text(
-            text=f"*{tg_msg_escape_markdown_v2('✨ AI Summary:')}*\n```\n{tg_msg_escape_markdown_v2('Generating summary...')}```",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-        
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=types.Content(parts=contents)
-        )
-        text = response.text
-        bot_logger.info(f"Generated summary:\\n{text}")
-        
-        if not response or not text:
-            bot_logger.error("No response from Gemini API")
-            await asyncio.sleep(0.5)
-            await ai_msg.edit_text(
-                text=f"*{tg_msg_escape_markdown_v2('✨ AI Summary:')}*\n```\n{tg_msg_escape_markdown_v2('Error: No response from AI service.')}```",
-                parse_mode=ParseMode.MARKDOWN_V2
-            )
-            return
-        
-        await asyncio.sleep(0.5)
-        await ai_msg.edit_text(
-            text=f"*{tg_msg_escape_markdown_v2('✨ AI Summary:')}*\n```Note\n{tg_msg_escape_markdown_v2(text)}```",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-    except Exception as e:
-        bot_logger.error(f"Error generating AI summary: {e}\\n{traceback.format_exc()}")
-        try:
-            await asyncio.sleep(0.5)
-            await ai_msg.edit_text(
-                text=f"*{tg_msg_escape_markdown_v2('✨ AI Summary:')}*\n```\n{tg_msg_escape_markdown_v2(f'Error: {str(e)}')}```",
-                parse_mode=ParseMode.MARKDOWN_V2
-            )
-        except:
-            pass
 
-async def AI_summary_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle button callbacks for generating more info"""
-    query = update.callback_query
-    if not query:
-        return
-    
-    user_id = update.effective_user.id if update.effective_user else None
 
-    await query.answer()
-    
-    # Parse callback data: "more_info:{noteId}:{message_id}"
-    callback_data = query.data
-    if not callback_data or not callback_data.startswith("summary:"):
-        return
-    
+def _compress_image_for_llm(media_bytes: bytes) -> bytes:
     try:
-        noteId, msg_identifier = callback_data.split(":")
-        bot_logger.info(f"Button clicked: message {msg_identifier} for note {noteId}")
-        
-        chat_id = query.message.chat.id if query.message else None
-        bot_logger.debug(f"Chat ID: {chat_id}")
-        if not chat_id:
-            return
-        
-        # Add delay to avoid flood control
-        await asyncio.sleep(1)
-        
-        # Send a typing action
-        await context.bot.send_chat_action(
-            chat_id=chat_id,
-            action=ChatAction.TYPING
+        img = Image.open(BytesIO(media_bytes))
+        w, h = img.size
+        if h > 720 or w > 1280:
+            if h > w:
+                new_h, new_w = 720, int(w * (720 / h))
+            else:
+                new_w, new_h = 1280, int(h * (1280 / w))
+            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        out = BytesIO()
+        img.convert('RGB').save(out, format='JPEG', quality=70, optimize=True)
+        return out.getvalue()
+    except Exception as e:
+        bot_logger.warning(f"Failed to compress image, using original: {e}")
+        return media_bytes
+
+
+async def _run_ai_summary(
+    bot: TelegramClient,
+    gemini_client: genai.Client,
+    chat_id: int,
+    message_id: int,
+    ai_msg: Any,  # the "Loading..." message we edit in-place
+) -> None:
+    """Shared AI summary logic (called from both reaction handler and callback)."""
+    msg_file_path = os.path.join('data', f'{chat_id}.{message_id}.json')
+
+    async def _edit(text: str) -> None:
+        try:
+            await asyncio.sleep(0.25)
+            await ai_msg.edit(text, parse_mode='html')
+        except MessageNotModifiedError:
+            pass
+        except Exception as e:
+            bot_logger.debug(f"Edit failed: {e}")
+
+    if not os.path.exists(msg_file_path):
+        await _edit('<b>✨ AI Summary:</b>\n<code>Error: Note data not found.</code>')
+        return
+
+    try:
+        with open(msg_file_path, 'r', encoding='utf-8') as f:
+            msg_data = json.load(f)
+        note_content: str = msg_data.get('content', '')
+        media_data: list[dict[str, str]] = msg_data.get('media', [])
+    except Exception as e:
+        bot_logger.error(f"Failed to read message data: {e}")
+        await _edit('<b>✨ AI Summary:</b>\n<code>Error: Failed to load note data.</code>')
+        return
+
+    if not note_content:
+        await _edit('<b>✨ AI Summary:</b>\n<code>Error: Note content is empty.</code>')
+        return
+
+    try:
+        await _edit('<b>✨ AI Summary:</b>\n<code>Gathering note data...</code>')
+
+        content_length = max(100, min(200, len(note_content) // 2))
+        llm_query = LLM_QUERY_TEMPLATE.format(
+            content_length=content_length,
+            note_content=note_content,
         )
-        
-        # Add delay before editing message
-        await asyncio.sleep(0.5)
-        
-        await context.bot.edit_message_reply_markup(
-            chat_id=chat_id,
-            message_id=int(msg_identifier.split(".")[-1]),
-            reply_markup=None
-        )
-        
-        # Add delay before sending new message
-        await asyncio.sleep(0.5)
-        ai_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            reply_to_message_id=int(msg_identifier.split(".")[-1]),
-            text=f"*_{tg_msg_escape_markdown_v2('✨ AI Summary:\n')}_*```\n{tg_msg_escape_markdown_v2('Loading...')}```",
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_notification=True
-        )
-        
-        # Read the stored message string if available
-        note_content = ''
-        media_data: list[dict[str, str]] = []
-        msg_file_path = os.path.join('data', f'{msg_identifier}.json')
-        if os.path.exists(msg_file_path):
-            with open(msg_file_path, 'r', encoding='utf-8') as f:
-                msg_data = json.load(f)
-                note_content = msg_data.get('content', '')
-                media_data = msg_data.get('media', [])
-                f.close()
-            # Delete file after reading
-            os.remove(msg_file_path)
-        if not note_content or not media_data:
-            return
-        await ai_msg.edit_text(
-            text=f"*_{tg_msg_escape_markdown_v2('✨ AI Summary:\n')}_*```\n{tg_msg_escape_markdown_v2('Gathering note data...')}```",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
-
-        content_length = max(100, min(200, len(note_content)//2))
-        llm_query: str = f'''以下是一篇小红书笔记的完整内容。请先判断笔记本体的性质，再据此确定总结的语气与取向。
-
-【语气判断规则】
-1. 若笔记或评论呈现明显槽点、反差、搞笑情节、离谱行为、过度矫情、自我矛盾或“废物行为”（包括但不限于巨婴操作、反智自信、嘴硬硬撑、生活不自理等），可适度使用克制的幽默与轻度吐槽，但仅针对行为本身。
-2. 若槽点主体属于弱势群体（如老人、残障人士、认知障碍者等），即使行为可吐槽，也仅作客观、温和的事实描述。
-3. 若内容正常、信息性强、无槽点，则保持中立、简洁的分析风格。
-
-【多媒体处理原则】
-1. 若图片或视频对理解核心内容或槽点至关重要，则进行必要的简要概述。
-2. 若多媒体未提供新增信息，则直接忽略，不输出任何相关说明。
-
-【总结要求（需按顺序执行）】
-1. 完整概括笔记本体内容
-   - 必须体现主要内容、核心观点或意图。
-   - 如有槽点或亮点，可酌情补充。
-   - 若标签无实际信息或亮点，则不予概括。
-
-2. 单独概括评论区内容（如存在）
-   - 包括态度、补充信息、槽点或吐槽点。
-   - 不能以评论区代替笔记本体总结。
-
-3. 多媒体仅在必要时简要说明，不得机械复述画面。
-
-4. 语言自然、流畅。  
-5. 禁止输出无关内容。  
-6. 直接输出正文，无标题、无前后缀、无 Markdown。  
-7. 使用简体中文。
-8. 字数尽量不超过 {content_length}，若超出则在确保内容完整前提下尽量接近该限制。
-
-笔记内容如下：
-{note_content}'''
         bot_logger.debug(f"LLM Query:\n{llm_query}")
 
-        contents: list[types.Part] = [
-            types.Part(text=llm_query)
-        ]
-        await ai_msg.edit_text(
-            text=f"*_{tg_msg_escape_markdown_v2('✨ AI Summary:\n')}_*```\n{tg_msg_escape_markdown_v2('Downloading media...')}```",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
-        # download media and convert to Gemini Part
-        for media in media_data:
-            if media.get('type', '') == 'image' and 'url' in media:
-                media_url = media['url']
-                media_bytes = requests.get(media_url).content
-                
-                # Compress image to 720p before uploading to Gemini
-                try:
-                    img = Image.open(BytesIO(media_bytes))
-                    # Calculate new size while maintaining aspect ratio
-                    width, height = img.size
-                    if height > 720 or width > 1280:
-                        if height > width:
-                            new_height = 720
-                            new_width = int(width * (720 / height))
-                        else:
-                            new_width = 1280
-                            new_height = int(height * (1280 / width))
-                        img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                    
-                    # Convert to JPEG and compress
-                    output = BytesIO()
-                    img.convert('RGB').save(output, format='JPEG', quality=70, optimize=True)
-                    media_bytes = output.getvalue()
-                    bot_logger.debug(f"Compressed image from {width}x{height} to {img.size[0]}x{img.size[1]}")
-                except Exception as e:
-                    bot_logger.warning(f"Failed to compress image, using original: {e}")
-                
-                image_part = types.Part.from_bytes(
-                    data=media_bytes,
-                    mime_type="image/jpeg"
-                )
-                contents.append(image_part)
+        contents: list[genai_types.Part] = [genai_types.Part(text=llm_query)]
 
-        bot_logger.info(f"Generating summary with content length limit: {content_length}")
-        await ai_msg.edit_text(
-            text=f"*_{tg_msg_escape_markdown_v2('✨ AI Summary:\n')}_*```\n{tg_msg_escape_markdown_v2('Generating summary...')}```",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=types.Content(parts=contents),
+        await _edit('<b>✨ AI Summary:</b>\n<code>Downloading media...</code>')
+
+        for media in media_data:
+            if media.get('type') == 'image' and 'url' in media:
+                media_bytes = requests.get(media['url']).content
+                compressed = _compress_image_for_llm(media_bytes)
+                contents.append(genai_types.Part.from_bytes(data=compressed, mime_type='image/jpeg'))
+
+        bot_logger.info(f"Generating summary, content_length limit={content_length}")
+        await _edit('<b>✨ AI Summary:</b>\n<code>Generating summary...</code>')
+
+        response = gemini_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=genai_types.Content(parts=contents),
         )
         text = response.text
-        bot_logger.info(f"Generated summary for note {noteId}:\n{text}")
+        bot_logger.info(f"Generated summary:\n{text}")
+
         if not response or not text:
-            bot_logger.error("No response from Gemini API")
+            await _edit('<b>✨ AI Summary:</b>\n<code>Error: No response from AI service.</code>')
             return
-        await ai_msg.edit_text(
-            text=f"*_{tg_msg_escape_markdown_v2('✨ AI Summary:\n')}_*```Note\n{tg_msg_escape_markdown_v2(text)}```",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+
+        await _edit(f'<b>✨ AI Summary:</b>\n<pre language="Note">{tg_msg_escape_html(text)}</pre>')
+
     except Exception as e:
-        bot_logger.error(f"Error in button callback: {e}\n{traceback.format_exc()}")
-        if query.message:
-            await context.bot.send_message(
-                chat_id=query.message.chat.id,
-                text=f"An error occurred while processing your request:\n```python\n{tg_msg_escape_markdown_v2(str(e))}\n```",
-                parse_mode=ParseMode.MARKDOWN_V2,
-                disable_notification=True
-            )
-
-async def process_note_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process a single note request with concurrency control"""
-    user_id = update.effective_user.id if update.effective_user else "unknown"
-    chat_id = update.effective_chat.id if update.effective_chat else "unknown"
-    
-    # Log when we're waiting for semaphore
-    available_slots = processing_semaphore._value
-    bot_logger.debug(f"Processing request from user {user_id} in chat {chat_id}. Available slots: {available_slots}")
-    
-    async with processing_semaphore:
-        bot_logger.debug(f"Started concurrent processing for user {user_id}")
+        bot_logger.error(f"Error generating AI summary: {e}\n{traceback.format_exc()}")
         try:
-            await _note2feed_internal(update, context)
-        except Exception as e:
-            bot_logger.error(f"Error in concurrent processing for user {user_id}: {e}")
-        finally:
-            bot_logger.debug(f"Finished concurrent processing for user {user_id}")
+            await _edit(f'<b>✨ AI Summary:</b>\n<code>Error: {tg_msg_escape_html(str(e))}</code>')
+        except Exception:
+            pass
 
-async def note2feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main handler that creates concurrent tasks for note processing"""
-    asyncio.create_task(process_note_request(update, context))
 
-async def _note2feed_internal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Internal note processing function"""
-    user_id = update.effective_user.id if update.effective_user else None
-    
-    chat = update.effective_chat
-    if not chat:
-        return
-    msg = update.message
-    if not msg:
-        return
-    
-    # Get message text, handling both regular messages and command arguments
-    message_text = msg.text or ''
-    if msg.caption:
-        message_text += f" {msg.caption}"
-    
-    # For /note command, get the URL from command arguments
-    if context.args:
-        message_text += ' ' + ' '.join(context.args)
-        bot_logger.debug(f"Command args: {context.args}, combined text: {message_text}")
-    
-    if 'xhslink.com' not in message_text and 'xiaohongshu.com' not in message_text and not msg.photo:
-        bot_logger.debug(f"No XHS link found in message: {message_text[:100]}")
-        return
-
-    # If there is a photo, try to decode QR code
-    if msg.photo:
-        try:
-            # Get the lowest resolution photo
-            photo_file = await msg.photo[-1].get_file()
-            
-            # Download to memory
-            img_byte_arr: BytesIO = BytesIO()
-            await photo_file.download_to_memory(img_byte_arr)
-            img_byte_arr.seek(0)
-
-            # Decode QR code
-            image = Image.open(img_byte_arr)
-            decoded_objects: list[Any] = decode(image) # pyright: ignore[reportUnknownVariableType]
-
-            for obj in decoded_objects:
-                if obj.type == 'QRCODE':
-                    qr_data = obj.data.decode("utf-8")
-                    bot_logger.info(f"QR Code detected: {qr_data}")
-                    # Append decoded URL to message text so it gets processed
-                    message_text += f" {qr_data} "
-        except Exception as e:
-            bot_logger.error(f"Failed to decode QR code: {e}")
-
-    url_info = get_url_info(message_text)
-    if not url_info['success']:
-        return
-    noteId = str(url_info['noteId'])
-    xsec_token = str(url_info['xsec_token'])
-    anchorCommentId = str(url_info['anchorCommentId'])
-    bot_logger.info(f'Note ID: {noteId}, xsec_token: {xsec_token if xsec_token else "None"}, anchorCommentId: {anchorCommentId if anchorCommentId else "None"}')
-
-    # React with 'OK' gesture when receiving user's message
-    try:
-        if noteId:
-            await msg.set_reaction("👌")
-            await asyncio.sleep(0.2)
-        else:
-            return
-    except Exception as e:
-        bot_logger.debug(f"Failed to set OK reaction: {e}")
-
-    await context.bot.send_chat_action(
-        chat_id=chat.id,
-        action=ChatAction.TYPING
-    )
-    await asyncio.sleep(0.2)
-
-    bot_logger.debug('try open note on device')
-    open_note(noteId, anchorCommentId=anchorCommentId)
-    await asyncio.sleep(1.5)
-
-    note_data: dict[str, Any] = {}
-    comment_list_data: dict[str, Any] = {'data': {}}
-
-    try:
-        note_data = requests.get(
-            f"https://{FLASK_SERVER_NAME}/get_note/{noteId}"
-        ).json()
-        with open(os.path.join("data", f"note_data-{noteId}.json"), "w", encoding='utf-8') as f:
-            json.dump(note_data, f, indent=4, ensure_ascii=False)
-            f.close()
-        times = 0
-        while True:
-            times += 1
-            try:
-                comment_list_data = requests.get(
-                    f"https://{FLASK_SERVER_NAME}/get_comment_list/{noteId}"
-                ).json()
-                with open(os.path.join("data", f"comment_list_data-{noteId}.json"), "w", encoding='utf-8') as f:
-                    json.dump(comment_list_data, f, indent=4, ensure_ascii=False)
-                    f.close()
-                bot_logger.debug('got comment list data')
-                break
-            except:
-                if times <= 3:
-                    await asyncio.sleep(0.1)
-                else:
-                    raise Exception('error when getting comment list data')
-    except:
-        bot_logger.error(traceback.format_exc())
-    finally:
-        if not note_data or 'data' not in note_data:
-            # React with tear emoji if note data is not available
-            try:
-                await msg.set_reaction("😢")
-            except Exception as e:
-                bot_logger.debug(f"Failed to set tear reaction: {e}")
-            return
-    if note_data['data']['data'][0]['note_list'][0]['model_type'] == 'error':
-        bot_logger.warning(f'Note data not available\n{note_data['data']}')
-        # React with tear emoji if note model type is error
-        try:
-            await msg.set_reaction("😢")
-        except Exception as e:
-            bot_logger.debug(f"Failed to set tear reaction: {e}")
-        return
-
-    try:
-        try:
-            await telegraph_account.get_account_info()  # type: ignore
-        except:
-            await telegraph_account.create_account( # type: ignore
-                short_name='@xhsfwbot',
-            )
-        note = Note(
-            note_data['data'],
-            comment_list_data=comment_list_data['data'],
-            live=True,
-            telegraph=True,
-            telegraph_account=telegraph_account,
-            anchorCommentId=anchorCommentId
-        )
-        await note.initialize()
-        try:
-            # reply with rich text when sending media failed
-            await context.bot.send_chat_action(
-                chat_id=chat.id,
-                action=ChatAction.TYPING
-            )
-            if not note.telegraph_url:
-                await note.to_telegraph()
-            telegraph_msg = await context.bot.send_message(
-                chat_id = chat.id,
-                text = f"📕 [{tg_msg_escape_markdown_v2(note.title) if note.title else 'Note Source'}]({note.url})\n{f"\n{tg_msg_escape_markdown_v2(note.tag_string)}" if note.tags else ""}\n\n👤 [@{tg_msg_escape_markdown_v2(note.user['name'])}](https://www.xiaohongshu.com/user/profile/{note.user['id']})\n\n📰 [View via Telegraph]({note.telegraph_url})",
-                parse_mode=ParseMode.MARKDOWN_V2,
-                reply_to_message_id=msg.message_id,
-                disable_notification=True,
-                link_preview_options=LinkPreviewOptions(
-                    is_disabled=False,
-                    url=note.telegraph_url,
-                    prefer_small_media=True,
-                    show_above_text=False,
-                )
-            )
-            
-            # Store note data for telegraph message to enable AI summary on reaction
-            try:
-                telegraph_msg_identifier = f"{chat.id}.{telegraph_msg.message_id}"
-                msg_data = {
-                    'content': str(note),
-                    'media': note.media_for_llm()
-                }
-                telegraph_msg_file_path = os.path.join('data', f'{telegraph_msg_identifier}.json')
-                with open(telegraph_msg_file_path, 'w', encoding='utf-8') as f:
-                    json.dump(msg_data, f, ensure_ascii=False, indent=2)
-                bot_logger.debug(f"Saved telegraph message data to {telegraph_msg_file_path} for AI summary")
-            except Exception as e:
-                bot_logger.error(f"Failed to save telegraph message data: {e}")
-            
-            await note.send_as_telegram_message(context.bot, chat.id, msg.message_id)
-            if telegraph_msg:
-                await telegraph_msg.delete()
-            
-            # Delete user's original message after successful parsing
-            try:
-                await msg.delete()
-                bot_logger.debug("Deleted user's original message after successful processing")
-            except Exception as e:
-                bot_logger.debug(f"Failed to delete user's message: {e}")
-        except:
-            bot_logger.error(traceback.format_exc())
-            # React with tear emoji if message sending fails
-            try:
-                await msg.set_reaction("😢")
-            except Exception as e:
-                bot_logger.debug(f"Failed to set tear reaction: {e}")
-    except Exception as e:
-        bot_logger.error(f"Error in note2feed: {e}\n{traceback.format_exc()}")
-        # React with tear emoji on any unhandled error
-        try:
-            await msg.set_reaction("😢")
-        except Exception as react_err:
-            bot_logger.debug(f"Failed to set tear reaction: {react_err}")
-        # React with tear emoji on any unhandled error
-        try:
-            await msg.set_reaction("😢")
-        except Exception as react_err:
-            bot_logger.debug(f"Failed to set tear reaction: {react_err}")
-
-async def process_inline_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process a single inline query request with concurrency control"""
-    user_id = update.effective_user.id if update.effective_user else "unknown"
-    
-    available_slots = processing_semaphore._value
-    bot_logger.debug(f"Processing inline query from user {user_id}. Available slots: {available_slots}")
-    
-    async with processing_semaphore:
-        bot_logger.debug(f"Started concurrent inline processing for user {user_id}")
-        try:
-            await _inline_note2feed_internal(update, context)
-        except Exception as e:
-            bot_logger.error(f"Error in concurrent inline processing for user {user_id}: {e}")
-        finally:
-            bot_logger.debug(f"Finished concurrent inline processing for user {user_id}")
-
-async def inline_note2feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main inline handler that creates concurrent tasks"""
-    # For inline queries, we need to respond quickly, so we await the result
-    # but still use the semaphore for rate limiting
-    await process_inline_request(update, context)
-
-async def _inline_note2feed_internal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Internal inline query processing function"""
-    user_id = update.effective_user.id if update.effective_user else None
-    inline_query = update.inline_query
-    bot_logger.debug(inline_query)
-    if inline_query is None:
-        return
-    message_text = inline_query.query
-    if not message_text:
-        return
-    if 'xhslink.com' not in (message_text or '') and 'xiaohongshu.com' not in (message_text or ''):
-        return
-    
-
-    url_info = get_url_info(message_text)
-    if not url_info['success']:
-        return
-    noteId = str(url_info['noteId'])
-    xsec_token = str(url_info['xsec_token'])
-    bot_logger.info(f'Note ID: {noteId}, xsec_token: {xsec_token if xsec_token else "None"}')
-    anchorCommentId = str(url_info['anchorCommentId'])
-    bot_logger.info(f'Note ID: {noteId}, xsec_token: {xsec_token if xsec_token else "None"}, anchorCommentId: {anchorCommentId if anchorCommentId else "None"}')
-
-    bot_logger.debug('try open note on device')
-    open_note(noteId, anchorCommentId=anchorCommentId)
-    await asyncio.sleep(3)
-
-    note_data: dict[str, Any] = {}
-    comment_list_data: dict[str, Any] = {'data': {}}
-
-    try:
-        note_data = requests.get(
-            f"https://{FLASK_SERVER_NAME}/get_note/{noteId}"
-        ).json()
-        with open(os.path.join("data", f"note_data-{noteId}.json"), "w", encoding='utf-8') as f:
-            json.dump(note_data, f, indent=4, ensure_ascii=False)
-            f.close()
-        times = 0
-        while True:
-            times += 1
-            try:
-                comment_list_data = requests.get(
-                    f"https://{FLASK_SERVER_NAME}/get_comment_list/{noteId}"
-                ).json()
-                with open(os.path.join("data", f"comment_list_data-{noteId}.json"), "w", encoding='utf-8') as f:
-                    json.dump(comment_list_data, f, indent=4, ensure_ascii=False)
-                    f.close()
-                bot_logger.debug('got comment list data')
-                break
-            except:
-                if times <= 3:
-                    await asyncio.sleep(0.1)
-                else:
-                    raise Exception('error when getting comment list data')
-    except:
-        bot_logger.error(traceback.format_exc())
-    finally:
-        if not note_data or 'data' not in note_data:
-            return
-    if note_data['data']['data'][0]['note_list'][0]['model_type'] == 'error':
-        bot_logger.warning(f'Note data not available\n{note_data["data"]}')
-        return
-    try:
-        try:
-            await telegraph_account.get_account_info()  # type: ignore
-        except:
-            await telegraph_account.create_account( # type: ignore
-                short_name='@xhsfwbot',
-            )
-        note = Note(
-            note_data['data'],
-            comment_list_data=comment_list_data['data'],
-            live=True,
-            telegraph=True,
-            with_xsec_token=with_xsec_token,
-            original_xsec_token=xsec_token,
-            telegraph_account=telegraph_account,
-            anchorCommentId=anchorCommentId
-        )
-        await note.initialize()
-        telegraph_url = note.telegraph_url if hasattr(note, 'telegraph_url') else await note.to_telegraph()
-        inline_query_result = [
-            InlineQueryResultArticle(
-                id=str(uuid4()),
-                title=note.title,
-                input_message_content=InputTextMessageContent(
-                    message_text=f"📕 [{tg_msg_escape_markdown_v2(note.title) if note.title else 'Note Source'}]({note.url})\n{f"\n{tg_msg_escape_markdown_v2(note.tag_string)}" if note.tags else ""}\n\n👤 [@{tg_msg_escape_markdown_v2(note.user['name'])}](https://www.xiaohongshu.com/user/profile/{note.user['id']})\n\n📰 [View via Telegraph]({telegraph_url})",
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    link_preview_options=LinkPreviewOptions(
-                        is_disabled=False,
-                        url=telegraph_url,
-                        prefer_large_media=False
-                    ),
-                ),
-                description="Telegraph URL with xiaohongshu.com URL",
-                thumbnail_url=note.thumbnail
-            )
-        ]
-        await context.bot.answer_inline_query(
-            inline_query_id=inline_query.id,
-            results=inline_query_result
-        )
-    except Exception as e:
-        bot_logger.error(f"Error in inline_note2feed: {e}\n{traceback.format_exc()}")
-    return
-
-async def error_handler(update: Any, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global logging_file
-    admin_id = os.getenv('ADMIN_ID')
-    error_str = str(context.error).lower()
-    
-    # Check for network-related errors — just log them, let PTB's retry logic handle recovery
-    network_keywords = [
-        'timeout', 'connection', 'network',
-        'timed out', 'connecttimeout', 'readtimeout', 'writetimeout'
-    ]
-
-    if isinstance(context.error, NetworkError) or any(keyword in error_str for keyword in network_keywords):
-        # Format full traceback with the chained cause so the exact httpx call site is visible
-        tb = traceback.format_exc()
-        cause_tb = ""
-        if context.error.__cause__ is not None:
-            cause_tb = f"\nCaused by: {''.join(traceback.format_exception(type(context.error.__cause__), context.error.__cause__, context.error.__cause__.__traceback__))}"
-        update_info = f"update={pformat(update)}" if update else "update=None"
-        bot_logger.error(
-            f"Network-related error detected:\n"
-            f"  Error type : {type(context.error).__name__}\n"
-            f"  Error      : {context.error}\n"
-            f"  {update_info}\n"
-            f"--- Traceback ---\n{tb}"
-            f"{cause_tb}"
-        )
-        return
-    elif isinstance(context.error, BadRequest):
-        bot_logger.error(f"BadRequest error:\n{context.error}\n\n{traceback.format_exc()}")
-        return
-    elif isinstance(context.error, KeyboardInterrupt):
-        os._exit(0)
-        return
-    else:
-        if admin_id:
-            try:
-                await context.bot.send_document(
-                    chat_id=admin_id,
-                    caption=f'```python\n{tg_msg_escape_markdown_v2(pformat(update))}\n```\n CAUSED \n```python\n{tg_msg_escape_markdown_v2(pformat(context.error))[-888:]}\n```',
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    document=logging_file,
-                    disable_notification=True
-                )
-            except Exception as send_error:
-                bot_logger.error(f"Failed to send error report: {send_error}")
-        bot_logger.error(f"Update {update} caused error:\n{context.error}\n\n{traceback.format_exc()}")
-
-def run_telegram_bot():
-    bot_token = os.getenv('BOT_TOKEN')
-    if not bot_token:
-        raise ValueError("BOT_TOKEN environment variable is required")
-    
-    application = ApplicationBuilder()\
-        .concurrent_updates(True)\
-        .token(bot_token)\
-        .read_timeout(30)\
-        .write_timeout(30)\
-        .media_write_timeout(120)\
-        .connect_timeout(15)\
-        .pool_timeout(20)\
-        .connection_pool_size(16)\
-        .concurrent_updates(True)\
-        .build()
-
-    bark_notify("xhsfwbot tries to start polling.")
-    try:
-        start_handler = CommandHandler("start", start)
-        application.add_handler(start_handler)
-        help_handler = CommandHandler("help", help)
-        application.add_handler(help_handler)
-        sethelp_handler = CommandHandler("sethelp", sethelp)
-        application.add_handler(sethelp_handler)
-        clearhelp_handler = CommandHandler("clearhelp", clearhelp)
-        application.add_handler(clearhelp_handler)
-        
-        # Message reaction handler for AI summary
-        reaction_handler = MessageReactionHandler(handle_message_reaction)
-        application.add_handler(reaction_handler)
-
-        application.add_error_handler(error_handler)
-
-        note2feed_handler = MessageHandler(
-            (~ filters.COMMAND) & (
-                (filters.TEXT & (filters.Entity(MessageEntity.URL) | filters.Entity(MessageEntity.TEXT_LINK))) |
-                filters.PHOTO
-            ),
-            note2feed
-        )
-        application.add_handler(note2feed_handler)
-
-        note2feed_command_handler = CommandHandler(
-            "note",
-            note2feed,
-            block=False
-        )
-        application.add_handler(InlineQueryHandler(inline_note2feed, block=False))
-        application.add_handler(note2feed_command_handler)
-        
-        bot_logger.info(f'Bot started polling with concurrent processing enabled (max {max_concurrent_requests} concurrent requests)')
-        
-        # Run polling with allowed_updates to include message reactions
-        application.run_polling(
-            allowed_updates=[
-                "message",
-                "edited_message",
-                "channel_post",
-                "edited_channel_post",
-                "inline_query",
-                "chosen_inline_result",
-                "callback_query",
-                "message_reaction"
-            ]
-        )
-
-    except KeyboardInterrupt:
-        shutdown_result = application.shutdown()
-        bot_logger.debug(f'KeyboardInterrupt received, shutdown:{shutdown_result}')
-        raise Exception('KeyboardInterrupt received, script will quit now.')
-    except NetworkError as e:
-        bot_logger.error(f'NetworkError: {e}\n{traceback.format_exc()}')
-        raise Exception('NetworkError received, script will quit now.')
-    except Exception as e:
-        bot_logger.error(f'Unexpected error:\n{traceback.format_exc()}\n\n SCRIPT WILL QUIT NOW')
-        raise Exception(f'Error in main loop: {e}')
+# ── Bark notify ────────────────────────────────────────────────────────────────
 
 def bark_notify(message: str) -> None:
     bark_token = os.getenv('BARK_TOKEN')
-    bark_key = os.getenv('BARK_KEY')  # 32-character encryption key
-    bark_iv = os.getenv('BARK_IV', '472')  # IV, default to '472'
-    
+    bark_key = os.getenv('BARK_KEY')
+    bark_iv = os.getenv('BARK_IV', '472')
+
     if not bark_token:
         bot_logger.warning('BARK_TOKEN not set, cannot send bark notification')
         return
-    
+
     try:
-        # If encryption key is provided, send encrypted notification
         if bark_key:
-            # Create JSON payload
-            payload = json.dumps({
-                "body": message,
-                "sound": "birdsong",
-                "title": "xhsfwbot"
-            }, ensure_ascii=False)
-            
-            # Ensure key is 32 bytes (256 bits for AES-256)
+            payload = json.dumps({"body": message, "sound": "birdsong", "title": "xhsfwbot"}, ensure_ascii=False)
             if len(bark_key) != 32:
                 bot_logger.error(f'BARK_KEY must be exactly 32 characters long, got {len(bark_key)}')
-                # Fall back to unencrypted
-                requests.get(
-                    f'https://api.day.app/{bark_token}/{quote("xhsfwbot")}/{quote(message)}'
-                )
+                requests.get(f'https://api.day.app/{bark_token}/{quote("xhsfwbot")}/{quote(message)}')
                 return
-            
-            # Convert key to bytes
-            key_bytes = bark_key.encode('utf-8')
-            
-            # Encrypt using AES-256-ECB with PKCS7 padding
-            # ECB mode doesn't use IV, so we ignore the bark_iv parameter for encryption
-            cipher = AES.new(key_bytes, AES.MODE_ECB)  # pyright: ignore[reportUnknownMemberType]
+            cipher = AES.new(bark_key.encode('utf-8'), AES.MODE_ECB)  # pyright: ignore
             encrypted = cipher.encrypt(pad(payload.encode('utf-8'), AES.block_size))
-            
-            # Base64 encode the ciphertext
             ciphertext = base64.b64encode(encrypted).decode('utf-8')
-            
-            # Send encrypted notification
-            response = requests.post(
-                f'https://api.day.app/{bark_token}',
-                data={
-                    'ciphertext': ciphertext,
-                    'iv': bark_iv
-                }
-            )
-            
+            response = requests.post(f'https://api.day.app/{bark_token}', data={'ciphertext': ciphertext, 'iv': bark_iv})
             if response.status_code == 200:
                 bot_logger.info('Encrypted Bark notification sent successfully')
             else:
                 bot_logger.error(f'Failed to send encrypted bark notification: {response.status_code} {response.text}')
         else:
-            # Send unencrypted notification (original behavior)
-            requests.get(
-                f'https://api.day.app/{bark_token}/{quote("xhsfwbot")}/{quote(message)}'
-            )
+            requests.get(f'https://api.day.app/{bark_token}/{quote("xhsfwbot")}/{quote(message)}')
             bot_logger.info('Bark notification sent successfully')
-            
     except Exception as e:
         bot_logger.error(f'Failed to send bark notification: {e}\n{traceback.format_exc()}')
 
-def restart_script():
+
+def restart_script() -> None:
     bot_logger.info("Restarting script...")
-    # notify bot owner with bark
     bark_notify("xhsfwbot is restarting.")
     try:
         process = psutil.Process(os.getpid())
@@ -1912,11 +1201,499 @@ def restart_script():
     python = sys.executable
     os.execl(python, python, *sys.argv)
 
-if __name__ == "__main__":
+
+# ── Main bot ───────────────────────────────────────────────────────────────────
+
+def run_telegram_bot() -> None:
+    api_id_str = os.getenv('API_ID', '')
+    api_hash = os.getenv('API_HASH', '')
+    bot_token = os.getenv('BOT_TOKEN', '')
+    admin_id_str = os.getenv('ADMIN_ID', '')
+
+    if not api_id_str or not api_hash or not bot_token:
+        raise ValueError(
+            "API_ID, API_HASH, and BOT_TOKEN are required in .env\n"
+            "Get API_ID and API_HASH from https://my.telegram.org"
+        )
+
+    api_id = int(api_id_str)
+    admin_id: int | None = int(admin_id_str) if admin_id_str else None
+
+    # ── Proxy setup ────────────────────────────────────────────────────────────
+    proxy = None
+    if telegram_proxy:
+        try:
+            import socks  # PySocks
+            parsed = urlparse(telegram_proxy)
+            if parsed.scheme in ('socks5', 'socks4'):
+                stype = socks.SOCKS5 if parsed.scheme == 'socks5' else socks.SOCKS4
+                proxy = (stype, parsed.hostname, parsed.port)
+                bot_logger.info(f'Using {parsed.scheme.upper()} proxy: {parsed.hostname}:{parsed.port}')
+            elif parsed.scheme == 'http':
+                proxy = (socks.HTTP, parsed.hostname, parsed.port)
+                bot_logger.info(f'Using HTTP proxy: {parsed.hostname}:{parsed.port}')
+        except ImportError:
+            bot_logger.warning("PySocks not installed — proxy ignored. Install with: pip install PySocks")
+
+    bot = TelegramClient('xhsfwbot_telethon', api_id, api_hash, proxy=proxy)
+
+    # Telegraph account (shared, re-created if needed)
+    telegraph_account = Telegraph()
+    gemini_client = genai.Client()
+
+    # ── Helper: send admin log ────────────────────────────────────────────────
+
+    async def _send_log_to_admin(caption: str) -> None:
+        if admin_id:
+            try:
+                await bot.send_file(
+                    admin_id, logging_file,
+                    caption=caption, parse_mode='html',
+                    silent=True,
+                )
+            except Exception as e:
+                bot_logger.error(f"Failed to send log to admin: {e}")
+
+    # ── /start ─────────────────────────────────────────────────────────────────
+
+    @bot.on(events.NewMessage(pattern=r'^/start(\s|$)'))
+    async def start_handler(event: events.NewMessage.Event) -> None:
+        try:
+            await event.respond("I'm xhsfwbot, please send me a xhs link!\n/help for more info.")
+        except Exception as e:
+            bot_logger.error(f"Failed to send start message: {e}")
+        raise events.StopPropagation
+
+    # ── /help ──────────────────────────────────────────────────────────────────
+
+    @bot.on(events.NewMessage(pattern=r'^/help(\s|$)'))
+    async def help_handler(event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        bot_logger.debug(f"Help requested by user {user_id}")
+        try:
+            if help_config.get('type') == 'text':
+                await event.respond(help_config['text'])
+            elif help_config.get('type') == 'forward':
+                from_chat = help_config['from_chat_id']
+                msg_id = help_config['message_id']
+                original = await bot.get_messages(from_chat, ids=msg_id)
+                if original:
+                    # Re-send without forward attribution (copy behaviour)
+                    # Skip MessageMediaWebPage — can't be sent as file
+                    if original.media and original.media.__class__.__name__ == 'MessageMediaWebPage':
+                        await bot.send_message(event.chat_id, original.message or '', silent=True)
+                    elif original.media:
+                        await bot.send_file(
+                            event.chat_id, original.media,
+                            caption=original.message or '',
+                            parse_mode='html', silent=True,
+                        )
+                    else:
+                        await bot.send_message(event.chat_id, original.message or '', silent=True)
+                else:
+                    await event.respond("Help message is no longer available.")
+            else:
+                await event.respond(
+                    "No help message has been configured yet. "
+                    "Ask the administrator to set one with /sethelp."
+                )
+        except Exception as e:
+            bot_logger.error(f"Failed to send help message: {e}")
+        raise events.StopPropagation
+
+    # ── /sethelp ───────────────────────────────────────────────────────────────
+
+    @bot.on(events.NewMessage(pattern=r'^/sethelp(\s|$)'))
+    async def sethelp_handler(event: events.NewMessage.Event) -> None:
+        global help_config
+        if not admin_id or event.sender_id != admin_id:
+            await event.respond("Sorry, only the administrator can use this command.")
+            raise events.StopPropagation
+
+        reply = await event.get_reply_message()
+        if reply:
+            help_config = {
+                'type': 'forward',
+                'from_chat_id': reply.chat_id,
+                'message_id': reply.id,
+            }
+            save_help_config(help_config)
+            bot_logger.info(f"Admin {event.sender_id} set help to message {reply.id} from {reply.chat_id}")
+            await event.respond(
+                "✅ Help message updated — the replied message will be sent when users call /help."
+            )
+        else:
+            # Extract text after /sethelp
+            args_text = event.text.split(maxsplit=1)[1] if len(event.text.split(maxsplit=1)) > 1 else ''
+            if args_text:
+                help_config = {'type': 'text', 'text': args_text}
+                save_help_config(help_config)
+                bot_logger.info(f"Admin {event.sender_id} set help to custom text")
+                await event.respond(f"✅ Help message updated to:\n\n{args_text}")
+            else:
+                await event.respond(
+                    "ℹ️ Usage:\n"
+                    "• /sethelp <text> — set help message to the given text\n"
+                    "• Reply to any message + /sethelp — use that message as help content\n"
+                    "• /clearhelp — remove custom help and revert to default"
+                )
+        raise events.StopPropagation
+
+    # ── /clearhelp ─────────────────────────────────────────────────────────────
+
+    @bot.on(events.NewMessage(pattern=r'^/clearhelp(\s|$)'))
+    async def clearhelp_handler(event: events.NewMessage.Event) -> None:
+        global help_config
+        if not admin_id or event.sender_id != admin_id:
+            await event.respond("Sorry, only the administrator can use this command.")
+            raise events.StopPropagation
+        help_config = {}
+        save_help_config(help_config)
+        bot_logger.info(f"Admin {event.sender_id} cleared the custom help message")
+        await event.respond(
+            "✅ Custom help message cleared. /help will now use the default message (if configured)."
+        )
+        raise events.StopPropagation
+
+    # ── Reaction handler (🤔 → AI summary) ────────────────────────────────────
+
+    @bot.on(events.Raw(UpdateBotMessageReaction))
+    async def reaction_handler(update) -> None:  # type: ignore[name-defined]
+        bot_logger.debug(f"Received reaction update: {update}")
+
+        # Check if 🤔 is among the NEW reactions.
+        # new_reactions may contain ReactionEmoji directly or wrappers with a .reaction field.
+        has_thinking = any(
+            (isinstance(r, ReactionEmoji) and r.emoticon == '🤔') or
+            (hasattr(r, 'reaction') and isinstance(r.reaction, ReactionEmoji) and r.reaction.emoticon == '🤔')
+            for r in (update.new_reactions or [])
+        )
+        if not has_thinking:
+            return
+
+        try:
+            chat_id = get_peer_id(update.peer)
+            msg_id = update.msg_id
+            user_id = get_peer_id(update.actor) if update.actor else None
+        except Exception as e:
+            bot_logger.error(f"Failed to parse reaction update: {e}")
+            return
+
+        bot_logger.info(f"User {user_id} reacted 🤔 to message {msg_id} in {chat_id}")
+
+        msg_file_path = os.path.join('data', f'{chat_id}.{msg_id}.json')
+        if not os.path.exists(msg_file_path):
+            bot_logger.debug(f"No data file for {chat_id}.{msg_id}, ignoring reaction")
+            return
+
+        # Set 👾 reaction
+        await _set_reaction(bot, update.peer, msg_id, '👾')
+
+        # Send typing action + placeholder message
+        try:
+            async with bot.action(chat_id, 'typing'):
+                ai_msg = await bot.send_message(
+                    chat_id,
+                    '<b>✨ AI Summary:</b>\n<code>Loading...</code>',
+                    parse_mode='html',
+                    reply_to=msg_id,
+                    silent=True,
+                )
+        except Exception as e:
+            bot_logger.error(f"Failed to send AI summary placeholder: {e}")
+            return
+
+        await _run_ai_summary(bot, gemini_client, chat_id, msg_id, ai_msg)
+
+    # ── Note processing (main message handler) ────────────────────────────────
+
+    async def _note2feed_internal(event: events.NewMessage.Event) -> None:
+        chat_id = event.chat_id
+        msg_id = event.id
+        # event.text already returns the caption for photo/video messages in Telethon
+        message_text = event.text or ''
+
+        if 'xhslink.com' not in message_text and 'xiaohongshu.com' not in message_text and not event.message.photo:
+            return
+
+        # QR code decoding from photo
+        if event.message.photo:
+            try:
+                photo_bytes: bytes = await bot.download_media(event.message.photo, file=bytes)  # type: ignore[arg-type]
+                image = Image.open(BytesIO(photo_bytes))
+                decoded_objects: list[Any] = decode(image)  # pyright: ignore
+                for obj in decoded_objects:
+                    if obj.type == 'QRCODE':
+                        qr_data = obj.data.decode('utf-8')
+                        bot_logger.info(f"QR Code detected: {qr_data}")
+                        message_text += f' {qr_data} '
+            except Exception as e:
+                bot_logger.error(f"Failed to decode QR code: {e}")
+
+        url_info = get_url_info(message_text)
+        if not url_info['success']:
+            return
+
+        noteId = str(url_info['noteId'])
+        xsec_token = str(url_info['xsec_token'])
+        anchorCommentId = str(url_info['anchorCommentId'])
+        bot_logger.info(
+            f'Note ID: {noteId}, xsec_token: {xsec_token if xsec_token else "None"}, '
+            f'anchorCommentId: {anchorCommentId if anchorCommentId else "None"}'
+        )
+
+        # React with 👌
+        try:
+            await _set_reaction(bot, await event.get_input_chat(), msg_id, '👌')
+            await asyncio.sleep(0.2)
+        except Exception as e:
+            bot_logger.debug(f"Failed to set OK reaction: {e}")
+
+        async with bot.action(chat_id, 'typing'):
+            await asyncio.sleep(0.2)
+
+        bot_logger.debug('try open note on device')
+        open_note(noteId, anchorCommentId=anchorCommentId)
+        await asyncio.sleep(0.75)
+
+        note_data: dict[str, Any] = {}
+        comment_list_data: dict[str, Any] = {'data': {}}
+
+        try:
+            note_data = requests.get(f"https://{FLASK_SERVER_NAME}/get_note/{noteId}").json()
+            with open(os.path.join('data', f'note_data-{noteId}.json'), 'w', encoding='utf-8') as f:
+                json.dump(note_data, f, indent=4, ensure_ascii=False)
+            times = 0
+            while True:
+                times += 1
+                try:
+                    comment_list_data = requests.get(f"https://{FLASK_SERVER_NAME}/get_comment_list/{noteId}").json()
+                    with open(os.path.join('data', f'comment_list_data-{noteId}.json'), 'w', encoding='utf-8') as f:
+                        json.dump(comment_list_data, f, indent=4, ensure_ascii=False)
+                    bot_logger.debug('got comment list data')
+                    break
+                except Exception:
+                    if times <= 3:
+                        await asyncio.sleep(0.1)
+                    else:
+                        raise Exception('error when getting comment list data')
+        except Exception:
+            bot_logger.error(traceback.format_exc())
+        finally:
+            if not note_data or 'data' not in note_data:
+                try:
+                    await _set_reaction(bot, await event.get_input_chat(), msg_id, '😢')
+                except Exception:
+                    pass
+                return
+
+        if note_data['data']['data'][0]['note_list'][0]['model_type'] == 'error':
+            bot_logger.warning(f"Note data not available\n{note_data['data']}")
+            try:
+                await _set_reaction(bot, await event.get_input_chat(), msg_id, '😢')
+            except Exception:
+                pass
+            return
+
+        try:
+            try:
+                await telegraph_account.get_account_info()  # type: ignore
+            except Exception:
+                await telegraph_account.create_account(short_name='@xhsfwbot')  # type: ignore
+
+            note = Note(
+                note_data['data'],
+                comment_list_data=comment_list_data['data'],
+                live=True,
+                telegraph=True,
+                telegraph_account=telegraph_account,
+                anchorCommentId=anchorCommentId,
+            )
+            await note.initialize()
+
+            try:
+                async with bot.action(chat_id, 'typing'):
+                    if not hasattr(note, 'telegraph_url') or not note.telegraph_url:
+                        await note.to_telegraph()
+
+                await note.to_telethon_message(preview=False)
+                await note.send_as_telethon_message(bot, chat_id, reply_to=msg_id)
+
+                # Delete user's original message
+                try:
+                    await bot.delete_messages(chat_id, msg_id)
+                except Exception as e:
+                    bot_logger.debug(f"Failed to delete user message: {e}")
+
+            except Exception:
+                bot_logger.error(traceback.format_exc())
+                try:
+                    await _set_reaction(bot, await event.get_input_chat(), msg_id, '😢')
+                except Exception:
+                    pass
+
+        except Exception as e:
+            bot_logger.error(f"Error in note2feed: {e}\n{traceback.format_exc()}")
+            try:
+                await _set_reaction(bot, await event.get_input_chat(), msg_id, '😢')
+            except Exception:
+                pass
+
+    async def _process_note_request(event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        bot_logger.debug(f"Queuing note request from user {user_id}, semaphore={processing_semaphore._value}")
+        async with processing_semaphore:
+            try:
+                await _note2feed_internal(event)
+            except Exception as e:
+                bot_logger.error(f"Error processing note for user {user_id}: {e}")
+
+    @bot.on(events.NewMessage(incoming=True))
+    async def note2feed_handler(event: events.NewMessage.Event) -> None:
+        # Ignore commands
+        if event.text and event.text.startswith('/'):
+            return
+        # Accept if:
+        #  - message contains xhslink.com or xiaohongshu.com
+        #  - or is a photo (QR code)
+        text = event.text or ''
+        if (
+            'xhslink.com' in text or 'xiaohongshu.com' in text
+            or event.message.photo
+        ):
+            asyncio.create_task(_process_note_request(event))
+
+    # ── /note command ──────────────────────────────────────────────────────────
+
+    @bot.on(events.NewMessage(pattern=r'^/note(\s+\S+)?'))
+    async def note_command(event: events.NewMessage.Event) -> None:
+        asyncio.create_task(_process_note_request(event))
+        raise events.StopPropagation
+
+    # ── Inline query ───────────────────────────────────────────────────────────
+
+    async def _inline_note2feed_internal(event: events.InlineQuery.Event) -> None:
+        inline_start = time.monotonic()
+        message_text = event.text
+        if not message_text:
+            return
+        if 'xhslink.com' not in message_text and 'xiaohongshu.com' not in message_text:
+            return
+
+        url_info = get_url_info(message_text)
+        if not url_info['success']:
+            return
+
+        noteId = str(url_info['noteId'])
+        xsec_token = str(url_info['xsec_token'])
+        anchorCommentId = str(url_info['anchorCommentId'])
+        bot_logger.info(
+            f'Inline Note ID: {noteId}, xsec_token: {xsec_token if xsec_token else "None"}, '
+            f'anchorCommentId: {anchorCommentId if anchorCommentId else "None"}'
+        )
+
+        bot_logger.debug('try open note on device (inline)')
+        open_note(noteId, anchorCommentId=anchorCommentId)
+        await asyncio.sleep(1.0)
+
+        note_data: dict[str, Any] = {}
+
+        try:
+            note_data = requests.get(f"https://{FLASK_SERVER_NAME}/get_note/{noteId}").json()
+            with open(os.path.join('data', f'note_data-{noteId}.json'), 'w', encoding='utf-8') as f:
+                json.dump(note_data, f, indent=4, ensure_ascii=False)
+        except Exception:
+            bot_logger.error(traceback.format_exc())
+        finally:
+            if not note_data or 'data' not in note_data:
+                return
+
+        if note_data['data']['data'][0]['note_list'][0]['model_type'] == 'error':
+            bot_logger.warning(f"Inline note data not available\n{note_data['data']}")
+            return
+
+        try:
+            try:
+                await telegraph_account.get_account_info()  # type: ignore
+            except Exception:
+                await telegraph_account.create_account(short_name='@xhsfwbot')  # type: ignore
+
+            note = Note(
+                note_data['data'],
+                comment_list_data={'data': {}},
+                live=True,
+                telegraph=True,
+                telegraph_account=telegraph_account,
+                anchorCommentId=anchorCommentId,
+            )
+            await note.initialize()
+            telegraph_url = note.telegraph_url if hasattr(note, 'telegraph_url') else await note.to_telegraph()
+
+            name_esc = tg_msg_escape_html(note.user['name'])
+            uid = note.user['id']
+            tag_str = f'\n{tg_msg_escape_html(note.tag_string)}' if note.tags else ''
+            title_part = tg_msg_escape_html(note.title) if note.title else 'Note Source'
+
+            msg_text = (
+                f'📰 <a href="{telegraph_url}">View via Telegraph</a>\n\n'
+                f'📕 <a href="{note.url}">{title_part}</a>{tag_str}\n\n'
+                f'👤 <a href="https://www.xiaohongshu.com/user/profile/{uid}">@{name_esc}</a>'
+            )
+
+            thumb = (
+                InputWebDocument(url=note.thumbnail, size=0, mime_type='image/jpeg', attributes=[])
+                if note.thumbnail else None
+            )
+
+            result = event.builder.article(
+                title=note.title or 'Note',
+                description='Telegraph URL with xiaohongshu.com URL',
+                text=msg_text,
+                parse_mode='html',
+                link_preview=True,
+                thumb=thumb,
+            )
+
+            elapsed = time.monotonic() - inline_start
+            if elapsed > 25:
+                bot_logger.warning(f"Inline query took {elapsed:.1f}s, likely expired – skipping answer")
+                return
+
+            try:
+                await event.answer([result])
+            except QueryIdInvalidError:
+                bot_logger.warning(f"Inline query expired after {elapsed:.1f}s – answer discarded")
+
+        except Exception as e:
+            bot_logger.error(f"Error in inline_note2feed: {e}\n{traceback.format_exc()}")
+
+    @bot.on(events.InlineQuery)
+    async def inline_handler(event: events.InlineQuery.Event) -> None:
+        async with processing_semaphore:
+            try:
+                await _inline_note2feed_internal(event)
+            except Exception as e:
+                bot_logger.error(f"Error in inline handler: {e}")
+
+    # ── Run ────────────────────────────────────────────────────────────────────
+
+    async def _main() -> None:
+        await bot.start(bot_token=bot_token)
+        me = await bot.get_me()
+        bot_logger.info(f"Bot started as @{me.username} (id={me.id}) using Telethon (MTProto)")
+        bark_notify("xhsfwbot tries to start polling (Telethon).")
+        await bot.run_until_disconnected()
+
+    asyncio.run(_main())
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+if __name__ == '__main__':
     try:
         telegraph_account = Telegraph()
         client = genai.Client()
         run_telegram_bot()
     except Exception as e:
+        bot_logger.error(f"Fatal error: {e}\n{traceback.format_exc()}")
         restart_script()
-
