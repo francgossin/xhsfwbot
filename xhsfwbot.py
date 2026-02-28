@@ -1,19 +1,3 @@
-"""
-tele.xhsfwbot.py — Telethon (MTProto) port of xhsfwbot.py.
-
-Key differences from xhsfwbot.py:
-  • Uses Telethon instead of python-telegram-bot → persistent MTProto connection,
-    dramatically lower per-call latency compared to HTTP Bot API.
-  • Messages use HTML formatting instead of MarkdownV2.
-  • Requires two extra .env variables:
-      API_ID=<integer from https://my.telegram.org>
-      API_HASH=<string from https://my.telegram.org>
-  • A session file "xhsfwbot_telethon.session" is created next to the script.
-
-Everything else (output content/structure, commands, AI summary, inline query,
-reactions, help config, bark notifications) is identical to xhsfwbot.py.
-"""
-
 import os
 import sys
 import re
@@ -92,6 +76,13 @@ bot_logger.setLevel(logging.INFO)
 max_concurrent_requests = 5
 processing_semaphore = asyncio.Semaphore(max_concurrent_requests)
 
+# ── AI summary limits ─────────────────────────────────────────────────────────
+
+# Maximum total media size (bytes) for AI summary to be available.
+# If the note's video or combined photo size exceeds this, the AI summary
+# hint is hidden and the 🤔 reaction is rejected.
+AI_SUMMARY_MAX_MEDIA_BYTES = 8 * 1024 * 1024  # 8 MB
+
 # ── Help config ────────────────────────────────────────────────────────────────
 
 HELP_CONFIG_FILE = 'help_config.json'
@@ -143,6 +134,76 @@ def _make_progress_bar(pct: float, width: int = 20) -> str:
     bar = '█' * filled + '░' * (width - filled)
     return f'[{bar}] {pct * 100:.0f}%'
 
+
+def _build_summary_footer(
+    send_as_file: bool,
+    include_live_videos: bool,
+    use_xsec: bool,
+    has_live_photos: bool,
+    reactions_used: dict[str, bool] | None = None,
+    ai_summary: str = '',
+    has_anchor_comments: bool = False,
+    anchor_comments_sent: bool = False,
+    has_xsec_token: bool = False,
+    media_too_large: bool = False,
+) -> str:
+    """Build a rich HTML footer for the progress/summary message."""
+    if reactions_used is None:
+        reactions_used = {}
+
+    parts: list[str] = []
+
+    # AI summary section (before flags)
+    if ai_summary:
+        parts.append(f'\n<b>✨ AI Summary</b>\n<pre language="Note">{ai_summary}</pre>')
+
+    # ── Flags ──
+    flag_items: list[tuple[str, str, bool]] = []
+    if has_xsec_token:
+        flag_items.append(('-x', 'xsec_token', use_xsec))
+    flag_items.append(('-f', 'send as file', send_as_file))
+    if has_live_photos:
+        flag_items.append(('-l', 'live photos', include_live_videos))
+    flag_lines = []
+    indent = '\u00A0\u00A0\u00A0'  # non-breaking spaces for Telegram indent
+    for flag, label, on in flag_items:
+        mark = '✅' if on else '◻️'
+        flag_lines.append(f'{indent}{mark} <code>{flag}</code>\u2002<code>{label}</code>')
+    parts.append(f'\n<b>🏷 Flags</b>\n' + '\n'.join(flag_lines))
+
+    # ── Reactions ──
+    react_lines: list[str] = []
+
+    if send_as_file:
+        react_lines.append(f'{indent}👨‍💻 Files — <i>included</i> <code>-f</code>')
+    elif reactions_used.get('file'):
+        react_lines.append(f'{indent}👨‍💻 <s>Files</s>\u2002✅')
+    else:
+        react_lines.append(f'{indent}👨‍💻 Files — <i>react to get</i>')
+
+    if has_live_photos and not include_live_videos:
+        if reactions_used.get('eyes'):
+            react_lines.append(f'{indent}👀 <s>Live photos</s>\u2002✅')
+        else:
+            react_lines.append(f'{indent}👀 Live photos — <i>react to get</i>')
+    elif has_live_photos and include_live_videos:
+        react_lines.append(f'{indent}👀 Live photos — <i>included</i> <code>-l</code>')
+
+    if not media_too_large:
+        if reactions_used.get('thinking'):
+            react_lines.append(f'{indent}🤔 <s>AI Summary</s>\u2002✅')
+        else:
+            react_lines.append(f'{indent}🤔 AI Summary — <i>react to get</i>')
+
+    if has_anchor_comments:
+        if anchor_comments_sent:
+            react_lines.append(f'{indent}💬 Anchor comment\u2002✅')
+        else:
+            react_lines.append(f'{indent}💬 Anchor comment — <i>⏳ sending</i>')
+
+    parts.append(f'\n<b>⚡ Reactions</b>\n' + '\n'.join(react_lines))
+
+    return ''.join(parts)
 
 def make_block_quotation_html(text: str, expandable: bool = True) -> str:
     """Wrap text in an HTML <blockquote>. Uses expandable when text is long."""
@@ -368,11 +429,13 @@ class Note:
             telegraph: bool = False,
             with_full_data: bool = False,
             telegraph_account: Telegraph | None = None,
-            anchorCommentId: str = ''
+            anchorCommentId: str = '',
+            xsec_token: str = '',
     ) -> None:
         self.telegraph_account = telegraph_account
         self.telegraph = telegraph
         self.live = live
+        self.xsec_token = xsec_token
         if not note_data['data']:
             raise Exception("Note data not found!")
         self.user: dict[str, str | int] = {
@@ -429,6 +492,9 @@ class Note:
                 })
         bot_logger.debug(f"Images found: {self.images_list}")
         self.url = get_clean_url(note_data['data'][0]['note_list'][0]['share_info']['link'])
+        if self.xsec_token:
+            sep = '&' if '?' in self.url else '?'
+            self.url += f'{sep}xsec_token={quote(self.xsec_token)}'
         self.noteId = re.findall(r"[a-z0-9]{24}", self.url)[0]
         self.video_url = ''
         if 'video' in note_data['data'][0]['note_list'][0]:
@@ -484,7 +550,10 @@ class Note:
         for lines in self.desc.split('\n'):
             line_html = tg_msg_escape_html(lines)
             html += f'<blockquote>{line_html}</blockquote>'
-        html += f'<h4>👤 <a href="https://www.xiaohongshu.com/user/profile/{self.user["id"]}"> @{self.user["name"]} ({self.user.get("red_id", "")})</a></h4>'
+        author_profile_url = f'https://www.xiaohongshu.com/user/profile/{self.user["id"]}'
+        if self.xsec_token:
+            author_profile_url += f'?xsec_token={quote(self.xsec_token)}'
+        html += f'<h4>👤 <a href="{author_profile_url}"> @{self.user["name"]} ({self.user.get("red_id", "")})</a></h4>'
         html += f'<img src="{self.user["image"]}"></img>'
         html += f'<p>{get_time_emoji(self.time)} {convert_timestamp_to_timestr(self.time)}</p>'
         html += f'<p>❤️ {self.liked_count} ⭐ {self.collected_count} 💬 {self.comments_count} 🔗 {self.shared_count}</p>'
@@ -494,9 +563,15 @@ class Note:
         if self.comments:
             html += '<hr>'
             for i, comment in enumerate(self.comments):
-                html += f'<h4>💬 <a href="https://www.xiaohongshu.com/discovery/item/{self.noteId}?anchorCommentId={comment["id"]}">Comment</a></h4>'
+                comment_url = f'https://www.xiaohongshu.com/discovery/item/{self.noteId}?anchorCommentId={comment["id"]}'
+                if self.xsec_token:
+                    comment_url += f'&xsec_token={quote(self.xsec_token)}'
+                html += f'<h4>💬 <a href="{comment_url}">Comment</a></h4>'
                 if 'target_comment' in comment:
-                    html += f'<p>↪️ <a href="https://www.xiaohongshu.com/user/profile/{comment["target_comment"]["user"]["userid"]}"> {'@' + comment["target_comment"]["user"].get("nickname", "")} ({comment["target_comment"]["user"].get('red_id', '')})</a></p>'
+                    tc_profile = f'https://www.xiaohongshu.com/user/profile/{comment["target_comment"]["user"]["userid"]}'
+                    if self.xsec_token:
+                        tc_profile += f'?xsec_token={quote(self.xsec_token)}'
+                    html += f'<p>↪️ <a href="{tc_profile}"> {'@' + comment["target_comment"]["user"].get("nickname", "")} ({comment["target_comment"]["user"].get('red_id', '')})</a></p>'
                 html += f'<p>{tg_msg_escape_html(replace_redemoji_with_emoji(comment["content"]))}</p>'
                 for pic in comment['pictures']:
                     if 'mp4' in pic:
@@ -506,12 +581,21 @@ class Note:
                 if comment.get('audio_url', ''):
                     html += f'<p><a href="{comment["audio_url"]}">🎤 Voice</a></p>'
                 html += f'<p>❤️ {comment["like_count"]} 💬 {comment["sub_comment_count"]}<br>📍 {tg_msg_escape_html(comment["ip_location"])}<br>{get_time_emoji(comment["time"])} {convert_timestamp_to_timestr(comment["time"])}</p>'
-                html += f'<p>👤 <a href="https://www.xiaohongshu.com/user/profile/{comment["user"]["userid"]}"> {'@' + comment["user"].get("nickname", "")} ({comment["user"].get("red_id", "")})</a></p>'
+                cu_profile = f'https://www.xiaohongshu.com/user/profile/{comment["user"]["userid"]}'
+                if self.xsec_token:
+                    cu_profile += f'?xsec_token={quote(self.xsec_token)}'
+                html += f'<p>👤 <a href="{cu_profile}"> {'@' + comment["user"].get("nickname", "")} ({comment["user"].get("red_id", "")})</a></p>'
                 for sub_comment in comment.get('sub_comments', []):
                     html += '<blockquote><blockquote>'
-                    html += f'<h4>💬 <a href="https://www.xiaohongshu.com/discovery/item/{self.noteId}?anchorCommentId={sub_comment["id"]}">Comment</a></h4>'
+                    sub_comment_url = f'https://www.xiaohongshu.com/discovery/item/{self.noteId}?anchorCommentId={sub_comment["id"]}'
+                    if self.xsec_token:
+                        sub_comment_url += f'&xsec_token={quote(self.xsec_token)}'
+                    html += f'<h4>💬 <a href="{sub_comment_url}">Comment</a></h4>'
                     if 'target_comment' in sub_comment:
-                        html += f'<br><p>  ↪️  <a href="https://www.xiaohongshu.com/user/profile/{sub_comment["target_comment"]["user"]["userid"]}"> {'@' + sub_comment["target_comment"]["user"].get("nickname", "")} ({sub_comment["target_comment"]["user"].get("red_id", "")})</a></p>'
+                        stc_profile = f'https://www.xiaohongshu.com/user/profile/{sub_comment["target_comment"]["user"]["userid"]}'
+                        if self.xsec_token:
+                            stc_profile += f'?xsec_token={quote(self.xsec_token)}'
+                        html += f'<br><p>  ↪️  <a href="{stc_profile}"> {'@' + sub_comment["target_comment"]["user"].get("nickname", "")} ({sub_comment["target_comment"]["user"].get("red_id", "")})</a></p>'
                     html += f'<br><p>{tg_msg_escape_html(replace_redemoji_with_emoji(sub_comment["content"]))}</p>'
                     for pic in sub_comment['pictures']:
                         if 'mp4' in pic:
@@ -521,7 +605,10 @@ class Note:
                     if sub_comment.get('audio_url', ''):
                         html += f'<br><p><a href="{sub_comment["audio_url"]}">🎤 Voice</a></p>'
                     html += f'<br><p>❤️ {sub_comment["like_count"]} 💬 {sub_comment["sub_comment_count"]}<br>📍 {tg_msg_escape_html(sub_comment["ip_location"])}<br>{get_time_emoji(sub_comment["time"])} {convert_timestamp_to_timestr(sub_comment["time"])}</p>'
-                    html += f'<br><p>👤 <a href="https://www.xiaohongshu.com/user/profile/{sub_comment["user"]["userid"]}"> {'@' + sub_comment["user"].get("nickname", "")} ({sub_comment["user"].get("red_id", "")})</a></p>'
+                    scu_profile = f'https://www.xiaohongshu.com/user/profile/{sub_comment["user"]["userid"]}'
+                    if self.xsec_token:
+                        scu_profile += f'?xsec_token={quote(self.xsec_token)}'
+                    html += f'<br><p>👤 <a href="{scu_profile}"> {'@' + sub_comment["user"].get("nickname", "")} ({sub_comment["user"].get("red_id", "")})</a></p>'
                     html += '</blockquote></blockquote>'
                 if i != len(self.comments) - 1:
                     html += '<hr>'
@@ -597,7 +684,10 @@ class Note:
         name_esc = tg_msg_escape_html(self.user['name'])
         red_id_esc = tg_msg_escape_html(self.user.get('red_id', ''))
         uid = self.user['id']
-        message += f'\n\n<a href="https://www.xiaohongshu.com/user/profile/{uid}">@{name_esc} ({red_id_esc})</a>'
+        profile_url = f'https://www.xiaohongshu.com/user/profile/{uid}'
+        if self.xsec_token:
+            profile_url += f'?xsec_token={quote(self.xsec_token)}'
+        message += f'\n\n<a href="{profile_url}">@{name_esc} ({red_id_esc})</a>'
 
         message += (
             f'\n<blockquote>'
@@ -619,6 +709,11 @@ class Note:
         bot: TelegramClient,
         chat_id: int,
         reply_to: int = 0,
+        send_as_file: bool = False,
+        include_live_videos: bool = False,
+        progress_msg=None,
+        use_xsec: bool = False,
+        has_xsec_token: bool = False,
     ) -> None:
         """Send this note to Telegram using the Telethon client."""
         sent_messages: list = []
@@ -628,16 +723,34 @@ class Note:
             else await self.to_telethon_message(preview=bool(self.length >= 666))
         )
 
-        # Collect photo URLs (non-live)
+        # Collect photo URLs (non-live) and live photo video URLs
         photo_urls = [img['url'] for img in self.images_list if not img['live']]
-        live_photo_count = sum(1 for img in self.images_list if img['live'])
+        live_photo_urls = [img['url'] for img in self.images_list if img['live']]
+        live_photo_count = len(live_photo_urls)
 
         # Handle video
         video_data: bytes | None = None
-        progress_msg = None
         dl_start_time = 0.0
         total_media = len(photo_urls) + (1 if self.video_url else 0)
-        show_progress = total_media > 1 or self.video_url
+        total_media_bytes = 0  # Track total media size for AI summary eligibility
+        show_progress = progress_msg is not None or total_media > 1 or self.video_url
+
+        # Count comment media for overall progress bar decision
+        comment_with_media_count = 0
+        comment_file_count = 0
+        if self.comments_with_context:
+            for c in self.comments_with_context:
+                cp = c['pictures']
+                if cp:
+                    n = len(cp) if include_live_videos else len([p for p in cp if 'mp4' not in p])
+                    if n > 0:
+                        comment_with_media_count += 1
+                        comment_file_count += n
+                elif c.get('audio_url', ''):
+                    comment_with_media_count += 1
+                    comment_file_count += 1
+        if not show_progress and (total_media + comment_file_count) > 1:
+            show_progress = True
 
         if self.video_url:
             try:
@@ -648,11 +761,17 @@ class Note:
 
                 if show_progress:
                     bar = _make_progress_bar(0)
-                    progress_msg = await bot.send_message(
-                        chat_id,
-                        f'📥 Downloading video ({size_mb:.1f} MB)...\n{bar}',
-                        reply_to=reply_to, silent=True,
-                    )
+                    msg_text = f'📥 Downloading video ({size_mb:.1f} MB)...\n{bar}'
+                    if progress_msg:
+                        try:
+                            await progress_msg.edit(msg_text)
+                        except MessageNotModifiedError:
+                            pass
+                    else:
+                        progress_msg = await bot.send_message(
+                            chat_id, msg_text,
+                            reply_to=reply_to, silent=True,
+                        )
 
                 # Stream download with progress
                 chunks: list[bytes] = []
@@ -676,6 +795,7 @@ class Note:
                         except MessageNotModifiedError:
                             pass
                 video_data = b''.join(chunks)
+                total_media_bytes += len(video_data)
                 dl_elapsed = time.monotonic() - dl_start_time
 
                 if progress_msg:
@@ -689,7 +809,65 @@ class Note:
             except Exception as e:
                 bot_logger.error(f"Failed to download video: {e}")
 
-        if video_data:
+        if video_data and send_as_file:
+            # ── Send video as document (file) ─────────────────────────────
+            async with bot.action(chat_id, 'document'):
+                try:
+                    video_io = BytesIO(video_data)
+                    video_io.name = 'video.mp4'
+                    upload_mb = len(video_data) / (1024 * 1024)
+                    ul_start_time = time.monotonic()
+
+                    if progress_msg:
+                        try:
+                            await progress_msg.edit(
+                                f'📤 Uploading file ({upload_mb:.1f} MB)...\n{_make_progress_bar(0)}'
+                            )
+                        except MessageNotModifiedError:
+                            pass
+
+                    upload_last_update = time.monotonic()
+
+                    async def _file_upload_progress(current: int, total: int) -> None:
+                        nonlocal upload_last_update
+                        if not progress_msg:
+                            return
+                        now = time.monotonic()
+                        if now - upload_last_update < 2:
+                            return
+                        upload_last_update = now
+                        pct = current / total if total else 0
+                        bar = _make_progress_bar(pct)
+                        cur_mb = current / (1024 * 1024)
+                        tot_mb = total / (1024 * 1024)
+                        try:
+                            await progress_msg.edit(
+                                f'📤 Uploading file ({tot_mb:.1f} MB)...\n{bar}  {cur_mb:.1f}/{tot_mb:.1f} MB'
+                            )
+                        except MessageNotModifiedError:
+                            pass
+
+                    result = await bot.send_file(
+                        chat_id, video_io,
+                        caption=caption, parse_mode='html',
+                        reply_to=reply_to, silent=True,
+                        force_document=True,
+                        progress_callback=_file_upload_progress if progress_msg else None,
+                    )
+                    sent_messages = result if isinstance(result, list) else [result]
+                    ul_elapsed = time.monotonic() - ul_start_time
+
+                    if progress_msg:
+                        try:
+                            summary = f'✅ Video file sent ({upload_mb:.1f} MB)\n'
+                            summary += f'📥 Download: {dl_elapsed:.1f}s | 📤 Upload: {ul_elapsed:.1f}s'
+                            await progress_msg.edit(summary)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    bot_logger.error(f"Failed to send video as file: {e}")
+
+        elif video_data:
             async with bot.action(chat_id, 'video'):
                 try:
                     # Probe video dimensions and duration with ffprobe
@@ -751,11 +929,17 @@ class Note:
                             pass
                     elif show_progress:
                         bar = _make_progress_bar(0)
-                        progress_msg = await bot.send_message(
-                            chat_id,
-                            f'📤 Uploading video ({upload_mb:.1f} MB)...\n{bar}',
-                            reply_to=reply_to, silent=True,
-                        )
+                        msg_text = f'📤 Uploading video ({upload_mb:.1f} MB)...\n{bar}'
+                        if progress_msg:
+                            try:
+                                await progress_msg.edit(msg_text)
+                            except MessageNotModifiedError:
+                                pass
+                        else:
+                            progress_msg = await bot.send_message(
+                                chat_id, msg_text,
+                                reply_to=reply_to, silent=True,
+                            )
 
                     async def _upload_progress(current: int, total: int) -> None:
                         nonlocal upload_last_update, progress_msg
@@ -791,10 +975,10 @@ class Note:
                     sent_messages = result if isinstance(result, list) else [result]
                     ul_elapsed = time.monotonic() - ul_start_time
 
-                    # Update progress message with summary
+                    # Update progress message with intermediate summary
                     if progress_msg:
                         try:
-                            summary = '✅ Video sent successfully\n'
+                            summary = '✅ Video sent\n'
                             summary += f'📦 Size: {upload_mb:.1f} MB'
                             if v_w and v_h:
                                 summary += f' | {v_w}×{v_h}'
@@ -806,38 +990,56 @@ class Note:
                                 mins, secs = divmod(v_dur, 60)
                                 summary += f'\n⏱ Duration: {mins}:{secs:02d}'
                             summary += f'\n📥 Download: {dl_elapsed:.1f}s | 📤 Upload: {ul_elapsed:.1f}s'
-                            if live_photo_count:
-                                summary += f'\n🎞 {live_photo_count} live photo(s) — view in Telegraph'
                             await progress_msg.edit(summary)
                         except Exception:
                             pass
                 except Exception as e:
                     bot_logger.error(f"Failed to send video: {e}\n{traceback.format_exc()}")
 
-        elif photo_urls:
-            async with bot.action(chat_id, 'photo'):
-                if show_progress:
-                    progress_msg = await bot.send_message(
-                        chat_id,
-                        f'📥 Downloading {len(photo_urls)} photo(s)...\n{_make_progress_bar(0)}',
-                        reply_to=reply_to, silent=True,
-                    )
+        elif photo_urls or (include_live_videos and live_photo_urls):
+            # Build download list, preserving interleaved order from images_list
+            download_list: list[dict[str, str]] = []
+            for img in self.images_list:
+                if img['live']:
+                    if include_live_videos:
+                        download_list.append({'url': img['url'], 'type': 'live_video'})
+                else:
+                    download_list.append({'url': img['url'], 'type': 'photo'})
+            total_download = len(download_list)
+
+            async with bot.action(chat_id, 'document' if send_as_file else 'photo'):
+                if show_progress or total_download > 1:
+                    msg_text = f'📥 Downloading {total_download} file(s)...\n{_make_progress_bar(0)}'
+                    if progress_msg:
+                        try:
+                            await progress_msg.edit(msg_text)
+                        except MessageNotModifiedError:
+                            pass
+                    else:
+                        progress_msg = await bot.send_message(
+                            chat_id, msg_text,
+                            reply_to=reply_to, silent=True,
+                        )
                 dl_start_time = time.monotonic()
                 last_update = dl_start_time
                 all_files: list[BytesIO] = []
-                for idx, url in enumerate(photo_urls):
-                    resp = requests.get(url)
+                for idx, item in enumerate(download_list):
+                    resp = requests.get(item['url'])
+                    total_media_bytes += len(resp.content)
                     bio = BytesIO(resp.content)
-                    bio.name = f'photo_{idx + 1}.jpg'
+                    if item['type'] == 'live_video':
+                        bio.name = f'live_{idx + 1}.mp4'
+                    else:
+                        bio.name = f'photo_{idx + 1}.jpg'
                     all_files.append(bio)
                     now = time.monotonic()
                     if progress_msg and now - last_update >= 1.5:
                         last_update = now
-                        pct = (idx + 1) / len(photo_urls)
+                        pct = (idx + 1) / total_download
                         bar = _make_progress_bar(pct)
                         try:
                             await progress_msg.edit(
-                                f'📥 Downloading photos...\n{bar}  {idx + 1}/{len(photo_urls)}'
+                                f'📥 Downloading files...\n{bar}  {idx + 1}/{total_download}'
                             )
                         except MessageNotModifiedError:
                             pass
@@ -862,7 +1064,8 @@ class Note:
                     batch = all_files[i:i + 10]
                     batch_idx = i // 10
                     batch_base_bytes = sum(f.getbuffer().nbytes for f in all_files[:i])
-                    cap = caption if i == 0 else None
+                    is_last_batch = (i + 10 >= len(all_files))
+                    cap = caption if is_last_batch else None
 
                     async def _photo_upload_progress(current: int, total: int) -> None:
                         nonlocal upload_last_update
@@ -888,10 +1091,11 @@ class Note:
                             chat_id, batch,
                             caption=cap, parse_mode='html',
                             reply_to=reply_to, silent=True,
+                            force_document=send_as_file,
                             progress_callback=_photo_upload_progress if progress_msg else None,
                         )
-                        if i == 0:
-                            sent_messages = result if isinstance(result, list) else [result]
+                        result_list = result if isinstance(result, list) else [result]
+                        sent_messages.extend(result_list)
                         uploaded_bytes = batch_base_bytes + sum(f.getbuffer().nbytes for f in batch)
                     except Exception as e:
                         bot_logger.error(f"Photo batch {i} failed ({e})\n{traceback.format_exc()}")
@@ -900,11 +1104,10 @@ class Note:
                 total_size = sum(f.getbuffer().nbytes for f in all_files) / (1024 * 1024)
                 if progress_msg:
                     try:
-                        summary = f'✅ {len(photo_urls)} photo(s) sent successfully\n'
+                        lv_included = sum(1 for d in download_list if d['type'] == 'live_video')
+                        summary = f'✅ {len(download_list)} file(s) sent\n'
                         summary += f'📦 Total size: {total_size:.1f} MB\n'
                         summary += f'📥 Download: {dl_elapsed:.1f}s | 📤 Upload: {ul_elapsed:.1f}s'
-                        if live_photo_count:
-                            summary += f'\n🎞 {live_photo_count} live photo(s) — view in Telegraph'
                         await progress_msg.edit(summary)
                     except Exception:
                         pass
@@ -916,16 +1119,43 @@ class Note:
                 reply_to=reply_to, silent=True, link_preview=False,
             )
             sent_messages = [msg]
+            # Clean up progress bar for text-only notes without comment media
+            if progress_msg and comment_with_media_count == 0:
+                try:
+                    await progress_msg.delete()
+                    progress_msg = None
+                except Exception:
+                    pass
 
         if not sent_messages:
             bot_logger.error("No message was sent!")
             return
 
-        # Persist message data for AI summary (🤔 reaction trigger)
+        # Persist message data for reactions (🤔 AI / 👨‍💻 files / 👀 live photos)
+        # Check live photos in both main note and comments
+        comment_has_live = any(
+            any('mp4' in p for p in c.get('pictures', []))
+            for c in self.comments_with_context
+        ) if self.comments_with_context else False
+        has_live_photos = live_photo_count > 0 or comment_has_live
         try:
             first_id = sent_messages[0].id
             msg_identifier = f"{chat_id}.{first_id}"
-            msg_data = {'content': str(self), 'media': self.media_for_llm()}
+            msg_data = {
+                'content': str(self),
+                'media': self.media_for_llm(),
+                'images_list': self.images_list,
+                'video_url': getattr(self, 'video_url', ''),
+                'progress_msg_id': progress_msg.id if progress_msg else None,
+                'reactions_used': {'file': False, 'eyes': False, 'thinking': False},
+                'ai_summary': '',
+                'flags': {'send_as_file': send_as_file, 'include_live_videos': include_live_videos, 'use_xsec': use_xsec},
+                'has_live_photos': has_live_photos,
+                'has_xsec_token': has_xsec_token,
+                'total_media_bytes': total_media_bytes,
+                'has_anchor_comments': bool(self.comments_with_context),
+                'anchor_comments_sent': False,
+            }
             with open(os.path.join('data', f'{msg_identifier}.json'), 'w', encoding='utf-8') as f:
                 json.dump(msg_data, f, indent=4, ensure_ascii=False)
             bot_logger.debug(f"Saved message data to data/{msg_identifier}.json")
@@ -937,8 +1167,21 @@ class Note:
         comment_id_to_msg_id: dict[str, int] = {}
 
         if self.comments_with_context:
+            comment_media_sent = 0
+            if comment_with_media_count > 0:
+                msg_text = f'💬 Sending comment media (0/{comment_with_media_count})...\n{_make_progress_bar(0)}'
+                if progress_msg:
+                    try:
+                        await progress_msg.edit(msg_text)
+                    except MessageNotModifiedError:
+                        pass
+                elif show_progress:
+                    progress_msg = await bot.send_message(
+                        chat_id, msg_text,
+                        reply_to=reply_to, silent=True,
+                    )
             for ci, comment in enumerate(self.comments_with_context):
-                comment_html = _build_comment_html(comment, self.noteId)
+                comment_html = _build_comment_html(comment, self.noteId, xsec_token=self.xsec_token)
 
                 this_reply_id = reply_id
                 if 'target_comment' in comment and ci > 0:
@@ -947,82 +1190,113 @@ class Note:
                         this_reply_id = comment_id_to_msg_id[target_id]
 
                 if comment['pictures']:
-                    pics = [p for p in comment['pictures'] if 'mp4' not in p]
+                    if include_live_videos:
+                        # Include all media (photos + videos) in original order
+                        pics = comment['pictures']
+                    else:
+                        # Exclude video URLs
+                        pics = [p for p in comment['pictures'] if 'mp4' not in p]
                     chunks = [pics[k:k + 10] for k in range(0, len(pics), 10)]
-                    async with bot.action(chat_id, 'photo'):
+                    async with bot.action(chat_id, 'document' if send_as_file else 'photo'):
                         for j, chunk in enumerate(chunks):
                             files = []
                             for idx, url in enumerate(chunk):
                                 resp = requests.get(url)
                                 bio = BytesIO(resp.content)
-                                bio.name = f'comment_{ci + 1}_{j + 1}_{idx + 1}.jpg'
+                                ext = '.mp4' if 'mp4' in url else '.jpg'
+                                bio.name = f'comment_{ci + 1}_{j + 1}_{idx + 1}{ext}'
                                 files.append(bio)
                             cap = comment_html if j == len(chunks) - 1 else None
                             result = await bot.send_file(
                                 chat_id, files,
                                 caption=cap, parse_mode='html',
                                 reply_to=this_reply_id, silent=True,
+                                force_document=send_as_file,
                             )
                             if j == len(chunks) - 1:
                                 r0 = result[0] if isinstance(result, list) else result
                                 comment_id_to_msg_id[comment['id']] = r0.id
 
                 elif comment.get('audio_url', ''):
-                    async with bot.action(chat_id, 'record-audio'):
-                        src_audio = requests.get(comment['audio_url']).content
-                        ogg = convert_to_ogg_opus_pipe(src_audio)
-                        mp3 = convert_to_mp3_pipe(src_audio)
-                        try:
-                            voice_io = BytesIO(ogg)
-                            voice_io.name = f'comment_{comment.get("id", "voice")}.ogg'
-                            result = await bot.send_file(
-                                chat_id, voice_io,
-                                caption=comment_html, parse_mode='html',
-                                reply_to=this_reply_id, silent=True,
-                                voice_note=True,
-                                attributes=[DocumentAttributeAudio(
-                                    duration=0,
-                                    voice=True,
-                                )],
-                            )
-                        except Exception as ve:
-                            bot_logger.warning(f"Voice-note send failed, fallback to music audio: {ve}")
+                    if send_as_file:
+                        # Send audio directly as file
+                        async with bot.action(chat_id, 'document'):
+                            src_audio = requests.get(comment['audio_url']).content
+                            mp3 = convert_to_mp3_pipe(src_audio)
+                            file_io = BytesIO(mp3 if mp3 else src_audio)
+                            file_io.name = f'comment_{comment.get("id", "voice")}.mp3'
                             try:
-                                music_io = BytesIO(mp3 if mp3 else src_audio)
-                                music_io.name = f'comment_{comment.get("id", "voice")}.mp3'
                                 result = await bot.send_file(
-                                    chat_id, music_io,
+                                    chat_id, file_io,
                                     caption=comment_html, parse_mode='html',
                                     reply_to=this_reply_id, silent=True,
-                                    voice_note=False,
+                                    force_document=True,
+                                )
+                            except Exception as fe:
+                                bot_logger.warning(f"Audio file send failed, fallback to text-only: {fe}")
+                                result = await bot.send_message(
+                                    chat_id, comment_html,
+                                    parse_mode='html',
+                                    reply_to=this_reply_id, silent=True,
+                                    link_preview=False,
+                                )
+                            comment_id_to_msg_id[comment['id']] = result.id  # type: ignore[union-attr]
+                    else:
+                        async with bot.action(chat_id, 'record-audio'):
+                            src_audio = requests.get(comment['audio_url']).content
+                            ogg = convert_to_ogg_opus_pipe(src_audio)
+                            mp3 = convert_to_mp3_pipe(src_audio)
+                            try:
+                                voice_io = BytesIO(ogg)
+                                voice_io.name = f'comment_{comment.get("id", "voice")}.ogg'
+                                result = await bot.send_file(
+                                    chat_id, voice_io,
+                                    caption=comment_html, parse_mode='html',
+                                    reply_to=this_reply_id, silent=True,
+                                    voice_note=True,
                                     attributes=[DocumentAttributeAudio(
                                         duration=0,
-                                        voice=False,
-                                        title='Comment Audio',
-                                        performer='xhsfwbot',
+                                        voice=True,
                                     )],
                                 )
-                            except Exception as ae:
-                                bot_logger.warning(f"Music-audio send failed, fallback to file: {ae}")
+                            except Exception as ve:
+                                bot_logger.warning(f"Voice-note send failed, fallback to music audio: {ve}")
                                 try:
-                                    file_io = BytesIO(mp3 if mp3 else (ogg if ogg else src_audio))
-                                    file_io.name = f'comment_{comment.get("id", "voice")}.mp3'
+                                    music_io = BytesIO(mp3 if mp3 else src_audio)
+                                    music_io.name = f'comment_{comment.get("id", "voice")}.mp3'
                                     result = await bot.send_file(
-                                        chat_id, file_io,
+                                        chat_id, music_io,
                                         caption=comment_html, parse_mode='html',
                                         reply_to=this_reply_id, silent=True,
-                                        force_document=True,
+                                        voice_note=False,
+                                        attributes=[DocumentAttributeAudio(
+                                            duration=0,
+                                            voice=False,
+                                            title='Comment Audio',
+                                            performer='xhsfwbot',
+                                        )],
                                     )
-                                except Exception as fe:
-                                    bot_logger.warning(f"All audio send methods failed, fallback to text-only: {fe}")
-                                    result = await bot.send_message(
-                                        chat_id, comment_html,
-                                        parse_mode='html',
-                                        reply_to=this_reply_id, silent=True,
-                                        link_preview=False,
-                                    )
+                                except Exception as ae:
+                                    bot_logger.warning(f"Music-audio send failed, fallback to file: {ae}")
+                                    try:
+                                        file_io = BytesIO(mp3 if mp3 else (ogg if ogg else src_audio))
+                                        file_io.name = f'comment_{comment.get("id", "voice")}.mp3'
+                                        result = await bot.send_file(
+                                            chat_id, file_io,
+                                            caption=comment_html, parse_mode='html',
+                                            reply_to=this_reply_id, silent=True,
+                                            force_document=True,
+                                        )
+                                    except Exception as fe:
+                                        bot_logger.warning(f"All audio send methods failed, fallback to text-only: {fe}")
+                                        result = await bot.send_message(
+                                            chat_id, comment_html,
+                                            parse_mode='html',
+                                            reply_to=this_reply_id, silent=True,
+                                            link_preview=False,
+                                        )
 
-                        comment_id_to_msg_id[comment['id']] = result.id  # type: ignore[union-attr]
+                            comment_id_to_msg_id[comment['id']] = result.id  # type: ignore[union-attr]
 
                 else:
                     async with bot.action(chat_id, 'typing'):
@@ -1034,19 +1308,90 @@ class Note:
                         )
                         comment_id_to_msg_id[comment['id']] = result.id
 
+                # Update comment media progress
+                if progress_msg and comment_with_media_count > 0:
+                    cp = comment['pictures']
+                    if cp:
+                        n = len(cp) if include_live_videos else len([p for p in cp if 'mp4' not in p])
+                        had_media = n > 0
+                    elif comment.get('audio_url', ''):
+                        had_media = True
+                    else:
+                        had_media = False
+                    if had_media:
+                        comment_media_sent += 1
+                        pct = comment_media_sent / comment_with_media_count
+                        bar = _make_progress_bar(pct)
+                        try:
+                            await progress_msg.edit(
+                                f'💬 Sending comment media...\n{bar}  {comment_media_sent}/{comment_with_media_count}'
+                            )
+                        except MessageNotModifiedError:
+                            pass
+
+            # Final progress summary for comment media
+            if progress_msg and comment_media_sent > 0:
+                try:
+                    parts = []
+                    if total_media > 0:
+                        parts.append(f'{total_media} main')
+                    parts.append(f'{comment_media_sent} comment')
+                    await progress_msg.edit(f'✅ Done — {" + ".join(parts)} media sent')
+                except Exception:
+                    pass
+
+        # Mark anchor comments as sent in JSON
+        anchor_comments_sent = bool(self.comments_with_context)
+        if anchor_comments_sent:
+            try:
+                fp = os.path.join('data', f'{msg_identifier}.json')
+                with open(fp, 'r', encoding='utf-8') as f:
+                    saved = json.load(f)
+                saved['anchor_comments_sent'] = True
+                with open(fp, 'w', encoding='utf-8') as f:
+                    json.dump(saved, f, indent=4, ensure_ascii=False)
+            except Exception as e:
+                bot_logger.debug(f"Failed to update anchor_comments_sent: {e}")
+
+        # ── Build final summary with footer ──────────────────────────────────
+        if progress_msg:
+            try:
+                # Read the current progress message text as base
+                current = (await bot.get_messages(chat_id, ids=progress_msg.id)).message or ''
+                footer = _build_summary_footer(
+                    send_as_file=send_as_file,
+                    include_live_videos=include_live_videos,
+                    use_xsec=use_xsec,
+                    has_live_photos=has_live_photos,
+                    has_anchor_comments=bool(self.comments_with_context),
+                    anchor_comments_sent=anchor_comments_sent,
+                    has_xsec_token=has_xsec_token,
+                    media_too_large=total_media_bytes > AI_SUMMARY_MAX_MEDIA_BYTES,
+                )
+                await progress_msg.edit(current + footer, parse_mode='html')
+            except MessageNotModifiedError:
+                pass
+            except Exception as e:
+                bot_logger.debug(f"Failed to set final summary footer: {e}")
+
 
 # ── Comment HTML builder ───────────────────────────────────────────────────────
 
-def _build_comment_html(comment: dict[str, Any], noteId: str) -> str:
+def _build_comment_html(comment: dict[str, Any], noteId: str, xsec_token: str = '') -> str:
     """Build the HTML text for a single comment message."""
     anchor = f'https://www.xiaohongshu.com/discovery/item/{noteId}?anchorCommentId={comment["id"]}'
+    if xsec_token:
+        anchor += f'&xsec_token={quote(xsec_token)}'
     text = f'💬 <a href="{anchor}">Comment</a>'
 
     if 'target_comment' in comment:
         nick = tg_msg_escape_html(comment['target_comment']['user'].get('nickname', ''))
         red_id = tg_msg_escape_html(comment['target_comment']['user'].get('red_id', ''))
-        uid = comment['target_comment']['user']['userid']
-        text += f'\n↪️ <a href="https://www.xiaohongshu.com/user/profile/{uid}">@{nick} ({red_id})</a>\n'
+        tc_uid = comment['target_comment']['user']['userid']
+        tc_profile = f'https://www.xiaohongshu.com/user/profile/{tc_uid}'
+        if xsec_token:
+            tc_profile += f'?xsec_token={quote(xsec_token)}'
+        text += f'\n↪️ <a href="{tc_profile}">@{nick} ({red_id})</a>\n'
     else:
         text += '\n'
 
@@ -1061,7 +1406,10 @@ def _build_comment_html(comment: dict[str, Any], noteId: str) -> str:
         f'❤️ {comment["like_count"]} 💬 {comment["sub_comment_count"]} '
         f'📍 {ip} {get_time_emoji(comment["time"])} {time_str}\n'
     )
-    text += f'👤 <a href="https://www.xiaohongshu.com/user/profile/{uid}">@{nick} ({red_id})</a>'
+    cu_profile = f'https://www.xiaohongshu.com/user/profile/{uid}'
+    if xsec_token:
+        cu_profile += f'?xsec_token={quote(xsec_token)}'
+    text += f'👤 <a href="{cu_profile}">@{nick} ({red_id})</a>'
     return text
 
 
@@ -1136,42 +1484,74 @@ async def _run_ai_summary(
     gemini_client: genai.Client,
     chat_id: int,
     message_id: int,
-    ai_msg: Any,  # the "Loading..." message we edit in-place
+    msg_file_path: str,
+    data: dict[str, Any],
 ) -> None:
-    """Shared AI summary logic (called from both reaction handler and callback)."""
-    msg_file_path = os.path.join('data', f'{chat_id}.{message_id}.json')
+    """Generate AI summary and edit it into the progress/summary message."""
+    progress_msg_id = data.get('progress_msg_id')
+    if not progress_msg_id:
+        bot_logger.warning("No progress_msg_id found for AI summary")
+        return
 
-    async def _edit(text: str) -> None:
+    flags = data.get('flags', {})
+    has_live = data.get('has_live_photos', False)
+    reactions_used = data.get('reactions_used', {})
+
+    async def _update_with_ai(ai_text: str) -> None:
+        """Edit the progress/summary message with AI summary in the footer."""
+        data['ai_summary'] = ai_text
         try:
+            with open(msg_file_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            bot_logger.debug(f"Failed to save ai_summary to JSON: {e}")
+        try:
+            msg = await bot.get_messages(chat_id, ids=progress_msg_id)
+            if not msg or not msg.message:
+                return
+            text = msg.message
+            # Strip old footer
+            ai_marker = '\n✨ AI Summary'
+            idx = text.find(ai_marker)
+            if idx != -1:
+                text = text[:idx]
+            else:
+                marker = '\n🏷 Flags'
+                idx = text.find(marker)
+                if idx != -1:
+                    text = text[:idx]
+            footer = _build_summary_footer(
+                send_as_file=flags.get('send_as_file', False),
+                include_live_videos=flags.get('include_live_videos', False),
+                use_xsec=flags.get('use_xsec', False),
+                has_live_photos=has_live,
+                reactions_used=reactions_used,
+                ai_summary=ai_text,
+                has_anchor_comments=data.get('has_anchor_comments', False),
+                anchor_comments_sent=data.get('anchor_comments_sent', False),
+                has_xsec_token=data.get('has_xsec_token', False),
+                media_too_large=data.get('total_media_bytes', 0) > AI_SUMMARY_MAX_MEDIA_BYTES,
+            )
             await asyncio.sleep(0.25)
-            await ai_msg.edit(text, parse_mode='html')
+            await msg.edit(text + footer, parse_mode='html')
         except MessageNotModifiedError:
             pass
         except Exception as e:
             bot_logger.debug(f"Edit failed: {e}")
 
-    if not os.path.exists(msg_file_path):
-        await _edit('<b>✨ AI Summary:</b>\n<code>Error: Note data not found.</code>')
-        return
-
-    try:
-        with open(msg_file_path, 'r', encoding='utf-8') as f:
-            msg_data = json.load(f)
-        note_content: str = msg_data.get('content', '')
-        media_data: list[dict[str, str]] = msg_data.get('media', [])
-    except Exception as e:
-        bot_logger.error(f"Failed to read message data: {e}")
-        await _edit('<b>✨ AI Summary:</b>\n<code>Error: Failed to load note data.</code>')
-        return
+    note_content: str = data.get('content', '')
+    media_data: list[dict[str, str]] = data.get('media', [])
 
     if not note_content:
-        await _edit('<b>✨ AI Summary:</b>\n<code>Error: Note content is empty.</code>')
+        await _update_with_ai('Error: Note content is empty.')
         return
 
     try:
-        await _edit('<b>✨ AI Summary:</b>\n<code>Gathering note data...</code>')
+        await _update_with_ai('Loading...')
 
-        content_length = max(100, min(200, len(note_content) // 2))
+        # Calculate available space: 4096 - base_msg - footer overhead
+        # Use a conservative limit for the AI summary text
+        content_length = max(60, min(120, len(note_content) // 3))
         llm_query = LLM_QUERY_TEMPLATE.format(
             content_length=content_length,
             note_content=note_content,
@@ -1180,7 +1560,7 @@ async def _run_ai_summary(
 
         contents: list[genai_types.Part] = [genai_types.Part(text=llm_query)]
 
-        await _edit('<b>✨ AI Summary:</b>\n<code>Downloading media...</code>')
+        await _update_with_ai('Downloading media...')
 
         for media in media_data:
             if media.get('type') == 'image' and 'url' in media:
@@ -1189,7 +1569,7 @@ async def _run_ai_summary(
                 contents.append(genai_types.Part.from_bytes(data=compressed, mime_type='image/jpeg'))
 
         bot_logger.info(f"Generating summary, content_length limit={content_length}")
-        await _edit('<b>✨ AI Summary:</b>\n<code>Generating summary...</code>')
+        await _update_with_ai('Generating summary...')
 
         response = gemini_client.models.generate_content(
             model='gemini-2.5-flash',
@@ -1199,15 +1579,17 @@ async def _run_ai_summary(
         bot_logger.info(f"Generated summary:\n{text}")
 
         if not response or not text:
-            await _edit('<b>✨ AI Summary:</b>\n<code>Error: No response from AI service.</code>')
+            await _update_with_ai('Error: No response from AI service.')
             return
 
-        await _edit(f'<b>✨ AI Summary:</b>\n<pre language="Note">{tg_msg_escape_html(text)}</pre>')
+        # Escape and store the final summary
+        escaped = tg_msg_escape_html(text)
+        await _update_with_ai(escaped)
 
     except Exception as e:
         bot_logger.error(f"Error generating AI summary: {e}\n{traceback.format_exc()}")
         try:
-            await _edit(f'<b>✨ AI Summary:</b>\n<code>Error: {tg_msg_escape_html(str(e))}</code>')
+            await _update_with_ai(f'Error: {tg_msg_escape_html(str(e))}')
         except Exception:
             pass
 
@@ -1337,15 +1719,15 @@ def run_telegram_bot() -> None:
                     # Re-send without forward attribution (copy behaviour)
                     # Skip MessageMediaWebPage — can't be sent as file
                     if original.media and original.media.__class__.__name__ == 'MessageMediaWebPage':
-                        await bot.send_message(event.chat_id, original.message or '', silent=True)
+                        await bot.send_message(event.chat_id, original.message or '', formatting_entities=original.entities, silent=True)
                     elif original.media:
                         await bot.send_file(
                             event.chat_id, original.media,
                             caption=original.message or '',
-                            parse_mode='html', silent=True,
+                            formatting_entities=original.entities, silent=True,
                         )
                     else:
-                        await bot.send_message(event.chat_id, original.message or '', silent=True)
+                        await bot.send_message(event.chat_id, original.message or '', formatting_entities=original.entities, silent=True)
                 else:
                     await event.respond("Help message is no longer available.")
             else:
@@ -1411,20 +1793,71 @@ def run_telegram_bot() -> None:
         )
         raise events.StopPropagation
 
-    # ── Reaction handler (🤔 → AI summary) ────────────────────────────────────
+    # ── Reaction handler (🤔 AI summary / 👨‍💻 resend as file / 👀 send live photos) ──
+
+    def _check_reaction(update, emoticon: str) -> bool:
+        """Check if a specific emoticon is among the NEW reactions."""
+        return any(
+            (isinstance(r, ReactionEmoji) and r.emoticon == emoticon) or
+            (hasattr(r, 'reaction') and isinstance(r.reaction, ReactionEmoji) and r.reaction.emoticon == emoticon)
+            for r in (update.new_reactions or [])
+        )
+
+    async def _update_summary_msg(
+        bot_client: TelegramClient, chat_id: int,
+        data: dict[str, Any], msg_file_path: str,
+    ) -> None:
+        """Update the progress/summary message footer to reflect current reaction status."""
+        progress_msg_id = data.get('progress_msg_id')
+        if not progress_msg_id:
+            return
+        flags = data.get('flags', {})
+        reactions_used = data.get('reactions_used', {})
+        has_live = data.get('has_live_photos', False)
+        ai_summary = data.get('ai_summary', '')
+        try:
+            msg = await bot_client.get_messages(chat_id, ids=progress_msg_id)
+            if not msg or not msg.message:
+                return
+            text = msg.message
+            # Strip old footer (AI summary + flags + reactions)
+            # AI summary marker comes first if present
+            ai_marker = '\n✨ AI Summary'
+            idx = text.find(ai_marker)
+            if idx != -1:
+                text = text[:idx]
+            else:
+                marker = '\n🏷 Flags'
+                idx = text.find(marker)
+                if idx != -1:
+                    text = text[:idx]
+            footer = _build_summary_footer(
+                send_as_file=flags.get('send_as_file', False),
+                include_live_videos=flags.get('include_live_videos', False),
+                use_xsec=flags.get('use_xsec', False),
+                has_live_photos=has_live,
+                reactions_used=reactions_used,
+                ai_summary=ai_summary,
+                has_anchor_comments=data.get('has_anchor_comments', False),
+                anchor_comments_sent=data.get('anchor_comments_sent', False),
+                has_xsec_token=data.get('has_xsec_token', False),
+                media_too_large=data.get('total_media_bytes', 0) > AI_SUMMARY_MAX_MEDIA_BYTES,
+            )
+            await msg.edit(text + footer, parse_mode='html')
+        except MessageNotModifiedError:
+            pass
+        except Exception as e:
+            bot_logger.debug(f"Failed to update summary footer: {e}")
 
     @bot.on(events.Raw(UpdateBotMessageReaction))
     async def reaction_handler(update) -> None:  # type: ignore[name-defined]
         bot_logger.debug(f"Received reaction update: {update}")
 
-        # Check if 🤔 is among the NEW reactions.
-        # new_reactions may contain ReactionEmoji directly or wrappers with a .reaction field.
-        has_thinking = any(
-            (isinstance(r, ReactionEmoji) and r.emoticon == '🤔') or
-            (hasattr(r, 'reaction') and isinstance(r.reaction, ReactionEmoji) and r.reaction.emoticon == '🤔')
-            for r in (update.new_reactions or [])
-        )
-        if not has_thinking:
+        has_thinking = _check_reaction(update, '🤔')
+        has_file = _check_reaction(update, '👨\u200d💻')
+        has_eyes = _check_reaction(update, '👀')
+
+        if not has_thinking and not has_file and not has_eyes:
             return
 
         try:
@@ -1435,31 +1868,222 @@ def run_telegram_bot() -> None:
             bot_logger.error(f"Failed to parse reaction update: {e}")
             return
 
-        bot_logger.info(f"User {user_id} reacted 🤔 to message {msg_id} in {chat_id}")
-
         msg_file_path = os.path.join('data', f'{chat_id}.{msg_id}.json')
         if not os.path.exists(msg_file_path):
             bot_logger.debug(f"No data file for {chat_id}.{msg_id}, ignoring reaction")
             return
 
+        # Load data and check if reaction was already used
+        with open(msg_file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        reactions_used = data.get('reactions_used', {})
+
+        # ── 👨‍💻 Resend media as files ─────────────────────────────────────────
+        if has_file:
+            bot_logger.info(f"User {user_id} reacted 👨‍💻 to message {msg_id} in {chat_id}")
+            if data.get('flags', {}).get('send_as_file'):
+                bot_logger.debug("Files already sent via -f flag, rejecting 👨‍💻")
+                await _set_reaction(bot, update.peer, msg_id, '🤷‍♂️')
+                return
+            if reactions_used.get('file'):
+                bot_logger.debug("File reaction already used, ignoring")
+                return
+            await _set_reaction(bot, update.peer, msg_id, '👌')
+            try:
+                images_list = data.get('images_list', [])
+                video_url = data.get('video_url', '')
+
+                # Collect all media URLs with proper naming:
+                # photo_1, live_1, photo_2, photo_3 (no live), ...
+                all_urls: list[dict[str, str]] = []
+                photo_num = 0
+                pending_live: dict[str, str] | None = None
+                for img in images_list:
+                    if img.get('live'):
+                        # Live entry comes before its photo; hold it
+                        pending_live = {'url': img['url']}
+                    else:
+                        photo_num += 1
+                        all_urls.append({'url': img['url'], 'name': f'photo_{photo_num}.jpg'})
+                        if pending_live:
+                            all_urls.append({'url': pending_live['url'], 'name': f'live_{photo_num}.mp4'})
+                            pending_live = None
+                if video_url:
+                    all_urls.append({'url': video_url, 'name': 'video_1.mp4'})
+
+                if not all_urls:
+                    bot_logger.debug("No media URLs found for 👨‍💻 reaction")
+                    return
+
+                total = len(all_urls)
+                bar = _make_progress_bar(0)
+                prog_msg = await bot.send_message(
+                    chat_id,
+                    f'📥 Downloading files (0/{total})...\n{bar}',
+                    reply_to=msg_id, silent=True,
+                )
+
+                all_files: list[BytesIO] = []
+                total_bytes = 0
+                dl_start = time.monotonic()
+                dl_last_edit = time.monotonic()
+                for idx, item in enumerate(all_urls):
+                    resp = requests.get(item['url'])
+                    bio = BytesIO(resp.content)
+                    bio.name = item['name']
+                    all_files.append(bio)
+                    total_bytes += len(resp.content)
+
+                    # Update download progress (throttled to every 2s, always update on last)
+                    now = time.monotonic()
+                    if now - dl_last_edit >= 2 or idx == total - 1:
+                        dl_last_edit = now
+                        pct = (idx + 1) / total
+                        bar = _make_progress_bar(pct)
+                        dl_mb = total_bytes / (1024 * 1024)
+                        try:
+                            await prog_msg.edit(
+                                f'📥 Downloading files ({idx + 1}/{total})...\n{bar}  {dl_mb:.1f} MB'
+                            )
+                        except MessageNotModifiedError:
+                            pass
+
+                dl_elapsed = time.monotonic() - dl_start
+                total_mb = total_bytes / (1024 * 1024)
+
+                # Upload phase
+                try:
+                    await prog_msg.edit(
+                        f'📤 Uploading {total} file(s) ({total_mb:.1f} MB)...\n{_make_progress_bar(0)}'
+                    )
+                except MessageNotModifiedError:
+                    pass
+
+                ul_start = time.monotonic()
+                ul_last_edit = time.monotonic()
+
+                # Track cumulative upload progress across batches
+                batches = list(range(0, len(all_files), 10))
+                files_uploaded = 0
+
+                for batch_idx, i in enumerate(batches):
+                    batch = all_files[i:i + 10]
+                    batch_size = sum(b.getbuffer().nbytes for b in batch)
+
+                    async def _file_react_upload_progress(current: int, total_up: int) -> None:
+                        nonlocal ul_last_edit
+                        now = time.monotonic()
+                        if now - ul_last_edit < 2:
+                            return
+                        ul_last_edit = now
+                        # Approximate overall progress
+                        done_bytes = sum(b.getbuffer().nbytes for b in all_files[:files_uploaded])
+                        overall_pct = (done_bytes + current) / total_bytes if total_bytes else 0
+                        bar = _make_progress_bar(overall_pct)
+                        cur_mb = (done_bytes + current) / (1024 * 1024)
+                        try:
+                            await prog_msg.edit(
+                                f'📤 Uploading {total} file(s) ({total_mb:.1f} MB)...\n{bar}  {cur_mb:.1f}/{total_mb:.1f} MB'
+                            )
+                        except MessageNotModifiedError:
+                            pass
+
+                    await bot.send_file(
+                        chat_id, batch,
+                        reply_to=msg_id, silent=True,
+                        force_document=True,
+                        progress_callback=_file_react_upload_progress,
+                    )
+                    files_uploaded += len(batch)
+
+                ul_elapsed = time.monotonic() - ul_start
+                bot_logger.info(f"Sent {len(all_files)} file(s) via 👨‍💻 reaction")
+
+                # Delete progress message
+                try:
+                    await prog_msg.delete()
+                except Exception:
+                    pass
+
+                # Mark reaction as used and update summary
+                data['reactions_used']['file'] = True
+                with open(msg_file_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=4, ensure_ascii=False)
+                await _update_summary_msg(bot, chat_id, data, msg_file_path)
+            except Exception as e:
+                bot_logger.error(f"Failed to resend media as files (👨‍💻): {e}\n{traceback.format_exc()}")
+            return
+
+        # ── 👀 Send missing live photos as videos ─────────────────────────────
+        if has_eyes:
+            bot_logger.info(f"User {user_id} reacted 👀 to message {msg_id} in {chat_id}")
+            if data.get('flags', {}).get('include_live_videos'):
+                bot_logger.debug("Live photos already included via -l flag, rejecting 👀")
+                await _set_reaction(bot, update.peer, msg_id, '🤷‍♂️')
+                return
+            if reactions_used.get('eyes'):
+                bot_logger.debug("Eyes reaction already used, ignoring")
+                return
+            try:
+                images_list = data.get('images_list', [])
+
+                live_urls = [img['url'] for img in images_list if img.get('live')]
+                if not live_urls:
+                    bot_logger.debug("No live photo URLs found for 👀 reaction")
+                    await _set_reaction(bot, update.peer, msg_id, '🤷‍♂️')
+                    return
+
+                await _set_reaction(bot, update.peer, msg_id, '👌')
+
+                live_files: list[BytesIO] = []
+                for idx, url in enumerate(live_urls):
+                    resp = requests.get(url)
+                    bio = BytesIO(resp.content)
+                    bio.name = f'live_{idx + 1}.mp4'
+                    live_files.append(bio)
+
+                for i in range(0, len(live_files), 10):
+                    batch = live_files[i:i + 10]
+                    await bot.send_file(
+                        chat_id, batch,
+                        reply_to=msg_id, silent=True,
+                    )
+                bot_logger.info(f"Sent {len(live_files)} live photo video(s) via 👀 reaction")
+
+                # Mark reaction as used and update summary
+                data['reactions_used']['eyes'] = True
+                with open(msg_file_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=4, ensure_ascii=False)
+                await _update_summary_msg(bot, chat_id, data, msg_file_path)
+            except Exception as e:
+                bot_logger.error(f"Failed to send live photos (👀): {e}\n{traceback.format_exc()}")
+            return
+
+        # ── 🤔 AI summary ────────────────────────────────────────────────────
+        bot_logger.info(f"User {user_id} reacted 🤔 to message {msg_id} in {chat_id}")
+        if reactions_used.get('thinking'):
+            bot_logger.debug("Thinking reaction already used, ignoring")
+            return
+
+        # Reject if media is too large for AI processing
+        if data.get('total_media_bytes', 0) > AI_SUMMARY_MAX_MEDIA_BYTES:
+            bot_logger.info("Media too large for AI summary, rejecting 🤔 reaction")
+            await _set_reaction(bot, update.peer, msg_id, '🤷‍♂️')
+            return
+
         # Set 👾 reaction
         await _set_reaction(bot, update.peer, msg_id, '👾')
 
-        # Send typing action + placeholder message
+        # Mark reaction as used before running
+        data['reactions_used']['thinking'] = True
         try:
-            async with bot.action(chat_id, 'typing'):
-                ai_msg = await bot.send_message(
-                    chat_id,
-                    '<b>✨ AI Summary:</b>\n<code>Loading...</code>',
-                    parse_mode='html',
-                    reply_to=msg_id,
-                    silent=True,
-                )
+            with open(msg_file_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
         except Exception as e:
-            bot_logger.error(f"Failed to send AI summary placeholder: {e}")
-            return
+            bot_logger.debug(f"Failed to pre-save thinking reaction state: {e}")
 
-        await _run_ai_summary(bot, gemini_client, chat_id, msg_id, ai_msg)
+        # Run AI summary — edits the progress/summary message in-place
+        await _run_ai_summary(bot, gemini_client, chat_id, msg_id, msg_file_path, data)
 
     # ── Note processing (main message handler) ────────────────────────────────
 
@@ -1557,6 +2181,11 @@ def run_telegram_bot() -> None:
             except Exception:
                 await telegraph_account.create_account(short_name='@xhsfwbot')  # type: ignore
 
+            # Parse flags: -x, -l, -f (or combined like -xl, -xlf, -fxl, etc.)
+            flag_chars = set()
+            for m in re.finditer(r'(?<!\S)-([xlf]+)(?!\S)', message_text):
+                flag_chars.update(m.group(1))
+            use_xsec = ('x' in flag_chars) and xsec_token
             note = Note(
                 note_data['data'],
                 comment_list_data=comment_list_data['data'],
@@ -1564,16 +2193,51 @@ def run_telegram_bot() -> None:
                 telegraph=True,
                 telegraph_account=telegraph_account,
                 anchorCommentId=anchorCommentId,
+                xsec_token=xsec_token if use_xsec else '',
             )
             await note.initialize()
 
             try:
+                send_as_file = 'f' in flag_chars
+                include_live_videos = 'l' in flag_chars
+
+                # Create early progress bar
+                progress_msg = await bot.send_message(
+                    chat_id,
+                    f'📝 Creating Telegraph page...\n{_make_progress_bar(0)}',
+                    reply_to=msg_id, silent=True,
+                )
+                tg_start = time.monotonic()
+
                 async with bot.action(chat_id, 'typing'):
                     if not hasattr(note, 'telegraph_url') or not note.telegraph_url:
                         await note.to_telegraph()
 
+                tg_elapsed = time.monotonic() - tg_start
+                try:
+                    await progress_msg.edit(
+                        f'✅ Telegraph created ({tg_elapsed:.1f}s)\n📋 Preparing message...'
+                    )
+                except MessageNotModifiedError:
+                    pass
+
                 await note.to_telethon_message(preview=False)
-                await note.send_as_telethon_message(bot, chat_id, reply_to=msg_id)
+
+                try:
+                    await progress_msg.edit(
+                        f'✅ Telegraph created ({tg_elapsed:.1f}s)\n📦 Sending media...'
+                    )
+                except MessageNotModifiedError:
+                    pass
+
+                await note.send_as_telethon_message(
+                    bot, chat_id, reply_to=msg_id,
+                    send_as_file=send_as_file,
+                    include_live_videos=include_live_videos,
+                    progress_msg=progress_msg,
+                    use_xsec=use_xsec,
+                    has_xsec_token=bool(xsec_token),
+                )
 
                 # Delete user's original message
                 try:
