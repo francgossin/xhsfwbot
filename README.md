@@ -7,7 +7,7 @@ A bot that forward REDNote to Telegram Message or Telegraph
 [![Require: Python 3.13](https://img.shields.io/badge/Python-3.13-blue?logo=python)](https://www.python.org/)
 
 [![Require: mitmproxy 12.1.2](https://img.shields.io/badge/mitmproxy-12.1.2-blue)](https://pypi.org/project/mitmproxy/)
-[![Require: python-telegram-bot 22.4](https://img.shields.io/badge/python--telegram--bot-22.4-blue)](https://pypi.org/project/python-telegram-bot/)
+[![Require: Telethon](https://img.shields.io/badge/Telethon-MTProto-blue)](https://pypi.org/project/telethon/)
 [![Require: telegraph 2.2.0](https://img.shields.io/badge/telegraph-2.2.0-blue)](https://pypi.org/project/telegraph/)
 [![Require: Flask 3.1.2](https://img.shields.io/badge/Flask-3.1.2-blue)](https://pypi.org/project/Flask/)
 [![Require: pytz 2025.2](https://img.shields.io/badge/pytz-2025.2-blue)](https://pypi.org/project/pytz/)
@@ -46,6 +46,8 @@ Create a `.env` file with your own configuration.
 ```python
 BOT_TOKEN="TelegramBotToken"
 ADMIN_ID=1234567890
+API_ID=12345678
+API_HASH="your_api_hash_from_my.telegram.org"
 
 # 0: Android with root; 1: Jailbroken iOS
 TARGET_DEVICE_TYPE=0
@@ -53,7 +55,8 @@ TARGET_DEVICE_TYPE=0
 FLASK_SERVER_NAME=example.com
 FLASK_SERVER_PORT=6789
 
-WHITELIST_ENABLED=true
+# optional: socks5://127.0.0.1:7890 or http://127.0.0.1:7890
+TELEGRAM_PROXY=
 
 BARK_TOKEN=barktoken
 BARK_KEY=barkkey
@@ -63,8 +66,6 @@ GEMINI_API_KEY=AIGEMINISERVICE
 
 CHANNEL_ID=-1234567890
 ```
-
-If you want to enable whitelist, create a channel and add bot as administrator. Anybody in this channel will be recognized as an authorized user.
 
 Run xhsfwbot.py, the network must have a stable access to Telegram and Gemini.
 ```bash
