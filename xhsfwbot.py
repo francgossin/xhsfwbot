@@ -9,7 +9,7 @@ import psutil
 import requests
 import traceback
 import subprocess
-import base64
+import platform
 from datetime import datetime, timedelta, timezone
 from pprint import pformat
 from dotenv import load_dotenv
@@ -17,8 +17,6 @@ from urllib.parse import unquote, urljoin, parse_qs, urlparse, quote
 from typing import Any
 from uuid import uuid4
 from io import BytesIO
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
 from google import genai
 from google.genai import types as genai_types
 
@@ -29,9 +27,7 @@ from telethon.tl.types import (
     DocumentAttributeVideo,
     InputWebDocument,
     ReactionEmoji,
-    UpdateBotMessageReaction,
 )
-from telethon.utils import get_peer_id
 from telethon.errors import (
     FloodWaitError,
     MessageNotModifiedError,
@@ -83,6 +79,111 @@ processing_semaphore = asyncio.Semaphore(max_concurrent_requests)
 # hint is hidden and the 🤔 reaction is rejected.
 AI_SUMMARY_MAX_MEDIA_BYTES = 8 * 1024 * 1024  # 8 MB
 
+
+class _OperationCancelled(Exception):
+    """Raised when a progress operation is cancelled by the user."""
+
+
+class _ProgressControl:
+    """Allows pausing/resuming/cancelling a running download/upload via inline keyboard buttons."""
+    __slots__ = ('_event', 'cancelled', 'paused', 'chat_id')
+
+    def __init__(self, chat_id: int) -> None:
+        self._event = asyncio.Event()
+        self._event.set()  # starts in "running" state
+        self.cancelled = False
+        self.paused = False
+        self.chat_id = chat_id
+
+    async def check(self) -> None:
+        """Call periodically in loops. Blocks while paused; raises on cancel."""
+        if self.cancelled:
+            raise _OperationCancelled()
+        if not self._event.is_set():
+            await self._event.wait()
+            if self.cancelled:
+                raise _OperationCancelled()
+
+    def pause(self) -> None:
+        self.paused = True
+        self._event.clear()
+
+    def resume(self) -> None:
+        self.paused = False
+        self._event.set()
+
+    def cancel(self) -> None:
+        self.cancelled = True
+        self.paused = False
+        self._event.set()  # unblock any waiter
+
+
+# Maps "chat_id.prog_msg_id" → control.  Registered while a progress bar is
+# active so the callback-query handler can look up controls.
+_progress_controls: dict[str, _ProgressControl] = {}
+
+
+def _progress_buttons(paused: bool = False, telegraph_url: str = '') -> list[list[Button]]:
+    """Return inline keyboard for progress bar messages."""
+    if paused:
+        rows: list[list[Button]] = [[Button.inline('▶️ Resume', b'prog_resume'),
+                                     Button.inline('❌ Cancel', b'prog_cancel')]]
+    else:
+        rows = [[Button.inline('⏸ Pause', b'prog_pause'),
+                 Button.inline('❌ Cancel', b'prog_cancel')]]
+    if telegraph_url:
+        rows.append([Button.url('📝 Telegraph', telegraph_url)])
+    return rows
+
+
+def _abort_url_buttons(
+    note_id: str,
+    anchor_comment_id: str = '',
+    xsec_token: str = '',
+    original_url: str = '',
+    telegraph_url: str = '',
+) -> list[list[Button]]:
+    """Build URL buttons shown after an operation is cancelled."""
+    anchor_qs = f'?anchorCommentId={anchor_comment_id}' if anchor_comment_id else ''
+    clean = f'https://www.xiaohongshu.com/explore/{note_id}{anchor_qs}'
+    # Group URL buttons: up to 3 per row
+    url_btns: list[Button] = [Button.url('✅ Clean URL', clean)]
+    if xsec_token:
+        sep = '&' if anchor_qs else '?'
+        xsec_url = f'{clean}{sep}xsec_token={quote(xsec_token)}'
+        url_btns.append(Button.url('⚠️ xsec_token', xsec_url))
+    if original_url and 'xhslink.com' in original_url:
+        url_btns.append(Button.url('☣️ Original', original_url))
+    rows: list[list[Button]] = [url_btns]
+    if telegraph_url:
+        rows.append([Button.url('📝 Telegraph', telegraph_url)])
+    return rows
+
+
+def _action_buttons(data: dict[str, Any]) -> list[list[Button]] | None:
+    """Build post-send action buttons (Files / Live Photos / AI Summary).
+
+    Returns None when no actions are available.
+    """
+    primary_id = data.get('_primary_id', '')
+    if not primary_id:
+        return None
+    flags = data.get('flags', {})
+    reactions_used = data.get('reactions_used', {})
+    has_live = data.get('has_live_photos', False)
+    media_too_large = data.get('total_media_bytes', 0) > AI_SUMMARY_MAX_MEDIA_BYTES
+
+    btns: list[Button] = []
+    if not flags.get('send_as_file') and not reactions_used.get('file'):
+        btns.append(Button.inline('📁 Files', f'act_files:{primary_id}'.encode()))
+    if has_live and not flags.get('include_live_videos') and not reactions_used.get('eyes'):
+        btns.append(Button.inline('📸 Live Photos', f'act_live:{primary_id}'.encode()))
+    if not reactions_used.get('thinking') and not media_too_large:
+        btns.append(Button.inline('🤖 AI Summary', f'act_ai:{primary_id}'.encode()))
+    if not btns:
+        return None
+    return [btns]
+
 # ── Help config ────────────────────────────────────────────────────────────────
 
 HELP_CONFIG_FILE = 'help_config.json'
@@ -128,11 +229,78 @@ def tg_msg_escape_html(t: str | int) -> str:
 
 
 def _make_progress_bar(pct: float, width: int = 20) -> str:
-    """Return a text progress bar like [████████░░░░░░░░░░░░] 40%"""
+    """Return a text progress bar like ████████░░░░░░░░░░░░"""
     pct = max(0.0, min(1.0, pct))
     filled = int(width * pct)
     bar = '█' * filled + '░' * (width - filled)
-    return f'[{bar}] {pct * 100:.0f}%'
+    return bar
+
+
+def _format_speed(start_time: float, transferred_bytes: int) -> str:
+    """Format transfer speed as MB/s."""
+    elapsed = time.monotonic() - start_time
+    if elapsed < 0.3 or transferred_bytes <= 0:
+        return ''
+    speed = transferred_bytes / elapsed / (1024 * 1024)
+    if speed >= 1:
+        return f'{speed:.1f} MB/s'
+    return f'{speed * 1024:.0f} KB/s'
+
+
+def _speed_str(elapsed: float, total_bytes: int) -> str:
+    """Format average speed from elapsed seconds and total bytes."""
+    if elapsed < 0.1 or total_bytes <= 0:
+        return ''
+    speed = total_bytes / elapsed / (1024 * 1024)
+    if speed >= 1:
+        return f'{speed:.1f} MB/s'
+    return f'{speed * 1024:.0f} KB/s'
+
+
+def _format_eta(start_time: float, pct: float) -> str:
+    """Format ETA string based on elapsed time and progress."""
+    if pct <= 0:
+        return ''
+    elapsed = time.monotonic() - start_time
+    if elapsed < 0.5:
+        return ''
+    total_est = elapsed / pct
+    remaining = total_est - elapsed
+    if remaining < 1:
+        return 'ETA <1s'
+    elif remaining < 60:
+        return f'ETA {remaining:.0f}s'
+    else:
+        mins = int(remaining // 60)
+        secs = int(remaining % 60)
+        return f'ETA {mins}m{secs:02d}s'
+
+
+def _progress_text(header: str, pct: float, detail: str = '',
+                   start_time: float | None = None,
+                   paused: bool = False,
+                   transferred_bytes: int = 0) -> str:
+    """Build a multi-line progress message with bar, percentage, detail, speed and ETA."""
+    bar = _make_progress_bar(pct)
+    if paused:
+        parts = ['⏸ Paused']
+        if detail:
+            parts.append(detail)
+        return f'⏸ Paused\n{bar}\n{" · ".join(parts)}'
+    if pct <= 0:
+        return f'{header}\n{bar}'
+    parts = [f'{pct * 100:.0f}%']
+    if detail:
+        parts.append(detail)
+    if start_time is not None:
+        speed = _format_speed(start_time, transferred_bytes)
+        if speed:
+            parts.append(speed)
+        eta = _format_eta(start_time, pct)
+        if eta:
+            parts.append(eta)
+    info_line = ' · '.join(parts)
+    return f'{header}\n{bar}\n{info_line}'
 
 
 def _build_summary_footer(
@@ -146,6 +314,8 @@ def _build_summary_footer(
     anchor_comments_sent: bool = False,
     has_xsec_token: bool = False,
     media_too_large: bool = False,
+    files_transfer_summary: str = '',
+    live_transfer_summary: str = '',
 ) -> str:
     """Build a rich HTML footer for the progress/summary message."""
     if reactions_used is None:
@@ -171,37 +341,35 @@ def _build_summary_footer(
         flag_lines.append(f'{indent}{mark} <code>{flag}</code>\u2002<code>{label}</code>')
     parts.append(f'\n<b>🏷 Flags</b>\n' + '\n'.join(flag_lines))
 
-    # ── Reactions ──
-    react_lines: list[str] = []
-
+    # ── Status lines ──
+    status_lines: list[str] = []
     if send_as_file:
-        react_lines.append(f'{indent}👨‍💻 Files — <i>included</i> <code>-f</code>')
+        status_lines.append(f'{indent}📁 Files — <i>included</i> <code>-f</code>')
     elif reactions_used.get('file'):
-        react_lines.append(f'{indent}👨‍💻 <s>Files</s>\u2002✅')
-    else:
-        react_lines.append(f'{indent}👨‍💻 Files — <i>react to get</i>')
-
-    if has_live_photos and not include_live_videos:
-        if reactions_used.get('eyes'):
-            react_lines.append(f'{indent}👀 <s>Live photos</s>\u2002✅')
-        else:
-            react_lines.append(f'{indent}👀 Live photos — <i>react to get</i>')
-    elif has_live_photos and include_live_videos:
-        react_lines.append(f'{indent}👀 Live photos — <i>included</i> <code>-l</code>')
-
-    if not media_too_large:
-        if reactions_used.get('thinking'):
-            react_lines.append(f'{indent}🤔 <s>AI Summary</s>\u2002✅')
-        else:
-            react_lines.append(f'{indent}🤔 AI Summary — <i>react to get</i>')
-
+        _f_icon = '🚫' if reactions_used['file'] == 'cancelled' else '✅'
+        _file_line = f'{indent}📁 <s>Files</s>\u2002{_f_icon}'
+        if files_transfer_summary:
+            for _ts_line in files_transfer_summary.split('\n'):
+                _file_line += f'\n{indent}\u2002\u2002{_ts_line}'
+        status_lines.append(_file_line)
+    if has_live_photos and include_live_videos:
+        status_lines.append(f'{indent}📸 Live photos — <i>included</i> <code>-l</code>')
+    elif has_live_photos and reactions_used.get('eyes'):
+        _l_icon = '🚫' if reactions_used['eyes'] == 'cancelled' else '✅'
+        _live_line = f'{indent}📸 <s>Live photos</s>\u2002{_l_icon}'
+        if live_transfer_summary:
+            for _ts_line in live_transfer_summary.split('\n'):
+                _live_line += f'\n{indent}\u2002\u2002{_ts_line}'
+        status_lines.append(_live_line)
+    if reactions_used.get('thinking'):
+        status_lines.append(f'{indent}🤖 <s>AI Summary</s>\u2002✅')
     if has_anchor_comments:
         if anchor_comments_sent:
-            react_lines.append(f'{indent}💬 Anchor comment\u2002✅')
+            status_lines.append(f'{indent}💬 Anchor comment\u2002✅')
         else:
-            react_lines.append(f'{indent}💬 Anchor comment — <i>⏳ sending</i>')
-
-    parts.append(f'\n<b>⚡ Reactions</b>\n' + '\n'.join(react_lines))
+            status_lines.append(f'{indent}💬 Anchor comment — <i>⏳ sending</i>')
+    if status_lines:
+        parts.append(f'\n<b>⚡ Actions</b>\n' + '\n'.join(status_lines))
 
     return ''.join(parts)
 
@@ -350,7 +518,7 @@ def parse_comment(comment_data: dict[str, Any]):
         'time': comment_data.get('time', 0),
         'like_count': comment_data.get('like_count', 0),
         'sub_comment_count': comment_data.get('sub_comment_count', 0),
-        'ip_location': comment_data.get('ip_location', '?'),
+        'ip_location': comment_data.get('ip_location', ''),
         'audio_url': audio_url,
     }
     if target_comment:
@@ -426,14 +594,11 @@ class Note:
             note_data: dict[str, Any],
             comment_list_data: dict[str, Any],
             live: bool = False,
-            telegraph: bool = False,
-            with_full_data: bool = False,
             telegraph_account: Telegraph | None = None,
             anchorCommentId: str = '',
             xsec_token: str = '',
     ) -> None:
         self.telegraph_account = telegraph_account
-        self.telegraph = telegraph
         self.live = live
         self.xsec_token = xsec_token
         if not note_data['data']:
@@ -450,10 +615,7 @@ class Note:
         bot_logger.debug(f"Note raw_desc\n\n {self.raw_desc}")
         self.desc = re.sub(r'(?P<tag>#\S+?)\[\S+\]#', r'\g<tag> ', self.raw_desc)
         self.time = note_data['data'][0]['note_list'][0]['time']
-        self.ip_location = (
-            note_data['data'][0]['note_list'][0]['ip_location']
-            if 'ip_location' in note_data['data'][0]['note_list'][0] else '?'
-        )
+        self.ip_location = note_data['data'][0]['note_list'][0].get('ip_location', '') or ''
         self.collected_count = note_data['data'][0]['note_list'][0]['collected_count']
         self.comments_count = note_data['data'][0]['note_list'][0]['comments_count']
         self.shared_count = note_data['data'][0]['note_list'][0]['shared_count']
@@ -501,12 +663,10 @@ class Note:
             self.video_url = note_data['data'][0]['note_list'][0]['video']['url']
             if not re.findall(r'sign=[0-9a-z]+', self.video_url):
                 self.video_url = re.sub(r'[0-9a-z\-]+\.xhscdn\.(com|net)', 'sns-bak-v1.xhscdn.com', self.video_url)
-        if telegraph:
-            self.to_html()
+        self.to_html()
 
     async def initialize(self) -> None:
-        if self.telegraph:
-            await self.to_telegraph()
+        await self.to_telegraph()
         self.short_preview = ''
 
     def to_dict(self) -> dict[str, str | int | Any]:
@@ -557,8 +717,8 @@ class Note:
         html += f'<img src="{self.user["image"]}"></img>'
         html += f'<p>{get_time_emoji(self.time)} {convert_timestamp_to_timestr(self.time)}</p>'
         html += f'<p>❤️ {self.liked_count} ⭐ {self.collected_count} 💬 {self.comments_count} 🔗 {self.shared_count}</p>'
-        ipaddr_html = tg_msg_escape_html(self.ip_location) if hasattr(self, 'ip_location') else '?'
-        html += f'<p>📍 {ipaddr_html}</p>'
+        if self.ip_location:
+            html += f'<p>📍 {tg_msg_escape_html(self.ip_location)}</p>'
         html += f'<blockquote><a href="{self.url}">Source</a></blockquote>' if not self.title else ''
         if self.comments:
             html += '<hr>'
@@ -580,7 +740,12 @@ class Note:
                         html += f'<img src="{pic}"></img>'
                 if comment.get('audio_url', ''):
                     html += f'<p><a href="{comment["audio_url"]}">🎤 Voice</a></p>'
-                html += f'<p>❤️ {comment["like_count"]} 💬 {comment["sub_comment_count"]}<br>📍 {tg_msg_escape_html(comment["ip_location"])}<br>{get_time_emoji(comment["time"])} {convert_timestamp_to_timestr(comment["time"])}</p>'
+                _c_ip = tg_msg_escape_html(comment['ip_location']) if comment.get('ip_location') else ''
+                _c_stats = f'❤️ {comment["like_count"]} 💬 {comment["sub_comment_count"]}'
+                if _c_ip:
+                    _c_stats += f'<br>📍 {_c_ip}'
+                _c_stats += f'<br>{get_time_emoji(comment["time"])} {convert_timestamp_to_timestr(comment["time"])}'
+                html += f'<p>{_c_stats}</p>'
                 cu_profile = f'https://www.xiaohongshu.com/user/profile/{comment["user"]["userid"]}'
                 if self.xsec_token:
                     cu_profile += f'?xsec_token={quote(self.xsec_token)}'
@@ -604,7 +769,12 @@ class Note:
                             html += f'<br><img src="{pic}"></img>'
                     if sub_comment.get('audio_url', ''):
                         html += f'<br><p><a href="{sub_comment["audio_url"]}">🎤 Voice</a></p>'
-                    html += f'<br><p>❤️ {sub_comment["like_count"]} 💬 {sub_comment["sub_comment_count"]}<br>📍 {tg_msg_escape_html(sub_comment["ip_location"])}<br>{get_time_emoji(sub_comment["time"])} {convert_timestamp_to_timestr(sub_comment["time"])}</p>'
+                    _sc_ip = tg_msg_escape_html(sub_comment['ip_location']) if sub_comment.get('ip_location') else ''
+                    _sc_stats = f'❤️ {sub_comment["like_count"]} 💬 {sub_comment["sub_comment_count"]}'
+                    if _sc_ip:
+                        _sc_stats += f'<br>📍 {_sc_ip}'
+                    _sc_stats += f'<br>{get_time_emoji(sub_comment["time"])} {convert_timestamp_to_timestr(sub_comment["time"])}'
+                    html += f'<br><p>{_sc_stats}</p>'
                     scu_profile = f'https://www.xiaohongshu.com/user/profile/{sub_comment["user"]["userid"]}'
                     if self.xsec_token:
                         scu_profile += f'?xsec_token={quote(self.xsec_token)}'
@@ -621,20 +791,25 @@ class Note:
         self.content += f'\n发布者：@{self.user["name"]} ({self.user.get('red_id', '')})\n'
         self.content += f'{get_time_emoji(self.time)} {convert_timestamp_to_timestr(self.time)}\n'
         self.content += f'点赞：{self.liked_count}收藏：{self.collected_count}评论：{self.comments_count}分享：{self.shared_count}\n'
-        ipaddr_html = (tg_msg_escape_html(self.ip_location) + '\n') if hasattr(self, 'ip_location') else '?\n'
-        self.content += f'IP 地址：{ipaddr_html}\n\n评论区：\n\n'
+        if self.ip_location:
+            self.content += f'IP 地址：{tg_msg_escape_html(self.ip_location)}\n'
+        self.content += '\n评论区：\n\n'
         if self.comments:
             self.content += '\n'
             for i, comment in enumerate(self.comments):
                 if comment["content"]:
                     self.content += '💬 评论\n'
                     self.content += f'{tg_msg_escape_html(replace_redemoji_with_emoji(comment["content"]))}\n'
-                    self.content += f'点赞：{comment["like_count"]}\nIP 地址：{tg_msg_escape_html(comment["ip_location"])}\n{get_time_emoji(comment["time"])} {convert_timestamp_to_timestr(comment["time"])}\n'
+                    _cip = comment.get('ip_location', '')
+                    _cip_line = f'\nIP 地址：{tg_msg_escape_html(_cip)}' if _cip else ''
+                    self.content += f'点赞：{comment["like_count"]}{_cip_line}\n{get_time_emoji(comment["time"])} {convert_timestamp_to_timestr(comment["time"])}\n'
                 for sub_comment in comment.get('sub_comments', []):
                     if sub_comment["content"]:
                         self.content += '💬 回复\n'
                         self.content += f'{tg_msg_escape_html(replace_redemoji_with_emoji(sub_comment["content"]))}\n'
-                        self.content += f'点赞：{sub_comment["like_count"]}\nIP 地址：{tg_msg_escape_html(sub_comment["ip_location"])}\n{get_time_emoji(sub_comment["time"])} {convert_timestamp_to_timestr(sub_comment["time"])}\n'
+                        _scip = sub_comment.get('ip_location', '')
+                        _scip_line = f'\nIP 地址：{tg_msg_escape_html(_scip)}' if _scip else ''
+                        self.content += f'点赞：{sub_comment["like_count"]}{_scip_line}\n{get_time_emoji(sub_comment["time"])} {convert_timestamp_to_timestr(sub_comment["time"])}\n'
                 if i != len(self.comments) - 1:
                     self.content += '\n'
         bot_logger.debug(f"String generated, \n\n{self.content}\n\n")
@@ -677,7 +852,7 @@ class Note:
                 message += make_block_quotation_html(self.desc)
             if hasattr(self, 'telegraph_url'):
                 message += f'\n📝 <a href="{self.telegraph_url}">Telegraph</a>'
-            elif self.telegraph:
+            else:
                 tg_url = await self.to_telegraph()
                 message += f'\n📝 <a href="{tg_url}">Telegraph</a>'
 
@@ -689,11 +864,12 @@ class Note:
             profile_url += f'?xsec_token={quote(self.xsec_token)}'
         message += f'\n\n<a href="{profile_url}">@{name_esc} ({red_id_esc})</a>'
 
+        _ip_line = f'\n📍 {tg_msg_escape_html(self.ip_location)}' if self.ip_location else ''
         message += (
             f'\n<blockquote>'
             f'❤️ {self.liked_count} ⭐ {self.collected_count} 💬 {self.comments_count} 🔗 {self.shared_count}\n'
-            f'{get_time_emoji(self.time)} {tg_msg_escape_html(convert_timestamp_to_timestr(self.time))}\n'
-            f'📍 {tg_msg_escape_html(self.ip_location) if hasattr(self, "ip_location") else "?"}'
+            f'{get_time_emoji(self.time)} {tg_msg_escape_html(convert_timestamp_to_timestr(self.time))}'
+            f'{_ip_line}'
             f'</blockquote>'
         )
 
@@ -714,6 +890,9 @@ class Note:
         progress_msg=None,
         use_xsec: bool = False,
         has_xsec_token: bool = False,
+        _progress_ctrl: '_ProgressControl | None' = None,
+        original_url: str = '',
+        anchor_comment_id: str = '',
     ) -> None:
         """Send this note to Telegram using the Telethon client."""
         sent_messages: list = []
@@ -734,6 +913,11 @@ class Note:
         total_media = len(photo_urls) + (1 if self.video_url else 0)
         total_media_bytes = 0  # Track total media size for AI summary eligibility
         show_progress = progress_msg is not None or total_media > 1 or self.video_url
+        _tg_url = self.telegraph_url if hasattr(self, 'telegraph_url') else ''
+
+        # Reply to progress/summary message instead of user's original message
+        if progress_msg:
+            reply_to = progress_msg.id
 
         # Count comment media for overall progress bar decision
         comment_with_media_count = 0
@@ -760,18 +944,21 @@ class Note:
                 bot_logger.info(f"Video size: {size_mb:.2f}MB")
 
                 if show_progress:
-                    bar = _make_progress_bar(0)
-                    msg_text = f'📥 Downloading video ({size_mb:.1f} MB)...\n{bar}'
+                    msg_text = _progress_text(f'📥 Downloading video ({size_mb:.1f} MB)...', 0)
+                    _btns = _progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None
                     if progress_msg:
                         try:
-                            await progress_msg.edit(msg_text)
+                            await progress_msg.edit(msg_text, buttons=_btns)
                         except MessageNotModifiedError:
                             pass
                     else:
                         progress_msg = await bot.send_message(
                             chat_id, msg_text,
                             reply_to=reply_to, silent=True,
+                            buttons=_btns,
                         )
+                        if _progress_ctrl:
+                            _progress_controls[f'{chat_id}.{progress_msg.id}'] = _progress_ctrl
 
                 # Stream download with progress
                 chunks: list[bytes] = []
@@ -780,17 +967,19 @@ class Note:
                 dl_start_time = last_update
                 resp = requests.get(self.video_url, stream=True)
                 for chunk in resp.iter_content(chunk_size=1024 * 256):
+                    if _progress_ctrl:
+                        await _progress_ctrl.check()
                     chunks.append(chunk)
                     downloaded += len(chunk)
                     now = time.monotonic()
                     if progress_msg and total_bytes and now - last_update >= 2:
                         last_update = now
                         pct = downloaded / total_bytes
-                        bar = _make_progress_bar(pct)
                         dl_mb = downloaded / (1024 * 1024)
                         try:
                             await progress_msg.edit(
-                                f'📥 Downloading video ({size_mb:.1f} MB)...\n{bar}  {dl_mb:.1f}/{size_mb:.1f} MB'
+                                _progress_text(f'📥 Downloading video ({size_mb:.1f} MB)...', pct, f'{dl_mb:.1f}/{size_mb:.1f} MB', dl_start_time, transferred_bytes=downloaded),
+                                buttons=_progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None,
                             )
                         except MessageNotModifiedError:
                             pass
@@ -800,9 +989,9 @@ class Note:
 
                 if progress_msg:
                     try:
-                        bar = _make_progress_bar(1)
                         await progress_msg.edit(
-                            f'📥 Video downloaded ({size_mb:.1f} MB, {dl_elapsed:.1f}s). Uploading...'
+                            f'📥 Video downloaded ({size_mb:.1f} MB, {dl_elapsed:.1f}s). Uploading...',
+                            buttons=_progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None,
                         )
                     except MessageNotModifiedError:
                         pass
@@ -821,7 +1010,8 @@ class Note:
                     if progress_msg:
                         try:
                             await progress_msg.edit(
-                                f'📤 Uploading file ({upload_mb:.1f} MB)...\n{_make_progress_bar(0)}'
+                                _progress_text(f'📤 Uploading file ({upload_mb:.1f} MB)...', 0),
+                                buttons=_progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None,
                             )
                         except MessageNotModifiedError:
                             pass
@@ -832,17 +1022,19 @@ class Note:
                         nonlocal upload_last_update
                         if not progress_msg:
                             return
+                        if _progress_ctrl and (_progress_ctrl.paused or _progress_ctrl.cancelled):
+                            return
                         now = time.monotonic()
                         if now - upload_last_update < 2:
                             return
                         upload_last_update = now
                         pct = current / total if total else 0
-                        bar = _make_progress_bar(pct)
                         cur_mb = current / (1024 * 1024)
                         tot_mb = total / (1024 * 1024)
                         try:
                             await progress_msg.edit(
-                                f'📤 Uploading file ({tot_mb:.1f} MB)...\n{bar}  {cur_mb:.1f}/{tot_mb:.1f} MB'
+                                _progress_text(f'📤 Uploading file ({tot_mb:.1f} MB)...', pct, f'{cur_mb:.1f}/{tot_mb:.1f} MB', ul_start_time, transferred_bytes=current),
+                                buttons=_progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None,
                             )
                         except MessageNotModifiedError:
                             pass
@@ -859,9 +1051,16 @@ class Note:
 
                     if progress_msg:
                         try:
+                            _dl_spd = _speed_str(dl_elapsed, len(video_data))
+                            _ul_spd = _speed_str(ul_elapsed, len(video_data))
                             summary = f'✅ Video file sent ({upload_mb:.1f} MB)\n'
-                            summary += f'📥 Download: {dl_elapsed:.1f}s | 📤 Upload: {ul_elapsed:.1f}s'
-                            await progress_msg.edit(summary)
+                            summary += f'📥 Download: {dl_elapsed:.1f}s'
+                            if _dl_spd:
+                                summary += f' ({_dl_spd})'
+                            summary += f'\n📤 Upload: {ul_elapsed:.1f}s'
+                            if _ul_spd:
+                                summary += f' ({_ul_spd})'
+                            await progress_msg.edit(summary, buttons=None)
                         except Exception:
                             pass
                 except Exception as e:
@@ -921,41 +1120,46 @@ class Note:
 
                     if progress_msg:
                         try:
-                            bar = _make_progress_bar(0)
                             await progress_msg.edit(
-                                f'📤 Uploading video ({upload_mb:.1f} MB)...\n{bar}'
+                                _progress_text(f'📤 Uploading video ({upload_mb:.1f} MB)...', 0),
+                                buttons=_progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None,
                             )
                         except MessageNotModifiedError:
                             pass
                     elif show_progress:
-                        bar = _make_progress_bar(0)
-                        msg_text = f'📤 Uploading video ({upload_mb:.1f} MB)...\n{bar}'
+                        msg_text = _progress_text(f'📤 Uploading video ({upload_mb:.1f} MB)...', 0)
+                        _btns = _progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None
                         if progress_msg:
                             try:
-                                await progress_msg.edit(msg_text)
+                                await progress_msg.edit(msg_text, buttons=_btns)
                             except MessageNotModifiedError:
                                 pass
                         else:
                             progress_msg = await bot.send_message(
                                 chat_id, msg_text,
                                 reply_to=reply_to, silent=True,
+                                buttons=_btns,
                             )
+                            if _progress_ctrl:
+                                _progress_controls[f'{chat_id}.{progress_msg.id}'] = _progress_ctrl
 
                     async def _upload_progress(current: int, total: int) -> None:
                         nonlocal upload_last_update, progress_msg
                         if not progress_msg:
+                            return
+                        if _progress_ctrl and (_progress_ctrl.paused or _progress_ctrl.cancelled):
                             return
                         now = time.monotonic()
                         if now - upload_last_update < 2:
                             return
                         upload_last_update = now
                         pct = current / total if total else 0
-                        bar = _make_progress_bar(pct)
                         cur_mb = current / (1024 * 1024)
                         tot_mb = total / (1024 * 1024)
                         try:
                             await progress_msg.edit(
-                                f'📤 Uploading video ({tot_mb:.1f} MB)...\n{bar}  {cur_mb:.1f}/{tot_mb:.1f} MB'
+                                _progress_text(f'📤 Uploading video ({tot_mb:.1f} MB)...', pct, f'{cur_mb:.1f}/{tot_mb:.1f} MB', ul_start_time, transferred_bytes=current),
+                                buttons=_progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None,
                             )
                         except MessageNotModifiedError:
                             pass
@@ -989,8 +1193,15 @@ class Note:
                             if v_dur:
                                 mins, secs = divmod(v_dur, 60)
                                 summary += f'\n⏱ Duration: {mins}:{secs:02d}'
-                            summary += f'\n📥 Download: {dl_elapsed:.1f}s | 📤 Upload: {ul_elapsed:.1f}s'
-                            await progress_msg.edit(summary)
+                            _dl_spd = _speed_str(dl_elapsed, len(video_data))
+                            _ul_spd = _speed_str(ul_elapsed, len(video_data))
+                            summary += f'\n📥 Download: {dl_elapsed:.1f}s'
+                            if _dl_spd:
+                                summary += f' ({_dl_spd})'
+                            summary += f'\n📤 Upload: {ul_elapsed:.1f}s'
+                            if _ul_spd:
+                                summary += f' ({_ul_spd})'
+                            await progress_msg.edit(summary, buttons=None)
                         except Exception:
                             pass
                 except Exception as e:
@@ -1009,21 +1220,27 @@ class Note:
 
             async with bot.action(chat_id, 'document' if send_as_file else 'photo'):
                 if show_progress or total_download > 1:
-                    msg_text = f'📥 Downloading {total_download} file(s)...\n{_make_progress_bar(0)}'
+                    msg_text = _progress_text(f'📥 Downloading {total_download} file(s)...', 0)
+                    _btns = _progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None
                     if progress_msg:
                         try:
-                            await progress_msg.edit(msg_text)
+                            await progress_msg.edit(msg_text, buttons=_btns)
                         except MessageNotModifiedError:
                             pass
                     else:
                         progress_msg = await bot.send_message(
                             chat_id, msg_text,
                             reply_to=reply_to, silent=True,
+                            buttons=_btns,
                         )
+                        if _progress_ctrl:
+                            _progress_controls[f'{chat_id}.{progress_msg.id}'] = _progress_ctrl
                 dl_start_time = time.monotonic()
                 last_update = dl_start_time
                 all_files: list[BytesIO] = []
                 for idx, item in enumerate(download_list):
+                    if _progress_ctrl:
+                        await _progress_ctrl.check()
                     resp = requests.get(item['url'])
                     total_media_bytes += len(resp.content)
                     bio = BytesIO(resp.content)
@@ -1036,10 +1253,10 @@ class Note:
                     if progress_msg and now - last_update >= 1.5:
                         last_update = now
                         pct = (idx + 1) / total_download
-                        bar = _make_progress_bar(pct)
                         try:
                             await progress_msg.edit(
-                                f'📥 Downloading files...\n{bar}  {idx + 1}/{total_download}'
+                                _progress_text('📥 Downloading files...', pct, f'{idx + 1}/{total_download}', dl_start_time, transferred_bytes=total_media_bytes),
+                                buttons=_progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None,
                             )
                         except MessageNotModifiedError:
                             pass
@@ -1048,7 +1265,8 @@ class Note:
                 if progress_msg:
                     try:
                         await progress_msg.edit(
-                            f'📤 Uploading {len(photo_urls)} photo(s)...\n{_make_progress_bar(0)}'
+                            _progress_text(f'📤 Uploading {len(photo_urls)} photo(s)...', 0),
+                            buttons=_progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None,
                         )
                     except MessageNotModifiedError:
                         pass
@@ -1056,47 +1274,61 @@ class Note:
                 ul_start_time = time.monotonic()
                 total_upload_bytes = sum(f.getbuffer().nbytes for f in all_files)
                 total_size = total_upload_bytes / (1024 * 1024)
-                uploaded_bytes = 0
                 upload_last_update = ul_start_time
                 num_batches = (len(all_files) + 9) // 10
 
-                for i in range(0, len(all_files), 10):
-                    batch = all_files[i:i + 10]
-                    batch_idx = i // 10
-                    batch_base_bytes = sum(f.getbuffer().nbytes for f in all_files[:i])
-                    is_last_batch = (i + 10 >= len(all_files))
-                    cap = caption if is_last_batch else None
+                # Pre-upload each file individually (progress_callback only
+                # works for single-file uploads, not album send_file calls).
+                uploaded_files = []
+                _completed_bytes = 0
+                for fi, bio in enumerate(all_files):
+                    if _progress_ctrl:
+                        await _progress_ctrl.check()
+                    file_size = bio.getbuffer().nbytes
+                    _file_completed = _completed_bytes  # snapshot for closure
 
-                    async def _photo_upload_progress(current: int, total: int) -> None:
+                    async def _per_file_progress(current: int, total: int,
+                                                 _base=_file_completed) -> None:
                         nonlocal upload_last_update
                         if not progress_msg:
+                            return
+                        if _progress_ctrl and (_progress_ctrl.paused or _progress_ctrl.cancelled):
                             return
                         now = time.monotonic()
                         if now - upload_last_update < 2:
                             return
                         upload_last_update = now
-                        overall = batch_base_bytes + current
+                        overall = _base + current
                         pct = overall / total_upload_bytes if total_upload_bytes else 0
-                        bar = _make_progress_bar(pct)
                         cur_mb = overall / (1024 * 1024)
                         try:
                             await progress_msg.edit(
-                                f'📤 Uploading photos ({batch_idx + 1}/{num_batches})...\n{bar}  {cur_mb:.1f}/{total_size:.1f} MB'
+                                _progress_text(f'📤 Uploading photos ({fi + 1}/{len(all_files)})...', pct, f'{cur_mb:.1f}/{total_size:.1f} MB', ul_start_time, transferred_bytes=overall),
+                                buttons=_progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None,
                             )
                         except MessageNotModifiedError:
                             pass
 
+                    input_file = await bot.upload_file(
+                        bio, progress_callback=_per_file_progress if progress_msg else None,
+                    )
+                    uploaded_files.append(input_file)
+                    _completed_bytes += file_size
+
+                # Send pre-uploaded files in album batches of 10
+                for i in range(0, len(uploaded_files), 10):
+                    batch = uploaded_files[i:i + 10]
+                    is_last_batch = (i + 10 >= len(uploaded_files))
+                    cap = caption if is_last_batch else None
                     try:
                         result = await bot.send_file(
                             chat_id, batch,
                             caption=cap, parse_mode='html',
                             reply_to=reply_to, silent=True,
                             force_document=send_as_file,
-                            progress_callback=_photo_upload_progress if progress_msg else None,
                         )
                         result_list = result if isinstance(result, list) else [result]
                         sent_messages.extend(result_list)
-                        uploaded_bytes = batch_base_bytes + sum(f.getbuffer().nbytes for f in batch)
                     except Exception as e:
                         bot_logger.error(f"Photo batch {i} failed ({e})\n{traceback.format_exc()}")
                 ul_elapsed = time.monotonic() - ul_start_time
@@ -1104,11 +1336,19 @@ class Note:
                 total_size = sum(f.getbuffer().nbytes for f in all_files) / (1024 * 1024)
                 if progress_msg:
                     try:
+                        total_bytes_photos = int(total_size * 1024 * 1024)
+                        _dl_spd = _speed_str(dl_elapsed, total_media_bytes)
+                        _ul_spd = _speed_str(ul_elapsed, total_bytes_photos)
                         lv_included = sum(1 for d in download_list if d['type'] == 'live_video')
                         summary = f'✅ {len(download_list)} file(s) sent\n'
                         summary += f'📦 Total size: {total_size:.1f} MB\n'
-                        summary += f'📥 Download: {dl_elapsed:.1f}s | 📤 Upload: {ul_elapsed:.1f}s'
-                        await progress_msg.edit(summary)
+                        summary += f'📥 Download: {dl_elapsed:.1f}s'
+                        if _dl_spd:
+                            summary += f' ({_dl_spd})'
+                        summary += f'\n📤 Upload: {ul_elapsed:.1f}s'
+                        if _ul_spd:
+                            summary += f' ({_ul_spd})'
+                        await progress_msg.edit(summary, buttons=None)
                     except Exception:
                         pass
 
@@ -1142,10 +1382,15 @@ class Note:
             first_id = sent_messages[0].id
             msg_identifier = f"{chat_id}.{first_id}"
             msg_data = {
+                '_primary_id': msg_identifier,
                 'content': str(self),
                 'media': self.media_for_llm(),
                 'images_list': self.images_list,
                 'video_url': getattr(self, 'video_url', ''),
+                'noteId': self.noteId,
+                'xsec_token': self.xsec_token,
+                'anchorCommentId': anchor_comment_id,
+                'original_url': original_url,
                 'progress_msg_id': progress_msg.id if progress_msg else None,
                 'reactions_used': {'file': False, 'eyes': False, 'thinking': False},
                 'ai_summary': '',
@@ -1156,9 +1401,26 @@ class Note:
                 'has_anchor_comments': bool(self.comments_with_context),
                 'anchor_comments_sent': False,
             }
-            with open(os.path.join('data', f'{msg_identifier}.json'), 'w', encoding='utf-8') as f:
+            primary_path = os.path.join('data', f'{msg_identifier}.json')
+            with open(primary_path, 'w', encoding='utf-8') as f:
                 json.dump(msg_data, f, indent=4, ensure_ascii=False)
             bot_logger.debug(f"Saved message data to data/{msg_identifier}.json")
+
+            # Create alias files so reactions on any media-group message
+            # or the summary message resolve to the primary data file.
+            alias_ids: set[int] = set()
+            for sm in sent_messages[1:]:
+                alias_ids.add(sm.id)
+            if progress_msg:
+                alias_ids.add(progress_msg.id)
+            for aid in alias_ids:
+                alias_path = os.path.join('data', f'{chat_id}.{aid}.json')
+                try:
+                    with open(alias_path, 'w', encoding='utf-8') as f:
+                        json.dump({'ref': msg_identifier}, f)
+                except Exception:
+                    pass
+            bot_logger.debug(f"Created {len(alias_ids)} alias file(s) for {msg_identifier}")
         except Exception as e:
             bot_logger.error(f"Failed to save message data: {e}")
 
@@ -1168,8 +1430,9 @@ class Note:
 
         if self.comments_with_context:
             comment_media_sent = 0
+            cm_start_time = time.monotonic()
             if comment_with_media_count > 0:
-                msg_text = f'💬 Sending comment media (0/{comment_with_media_count})...\n{_make_progress_bar(0)}'
+                msg_text = _progress_text(f'💬 Sending comment media (0/{comment_with_media_count})...', 0)
                 if progress_msg:
                     try:
                         await progress_msg.edit(msg_text)
@@ -1321,10 +1584,9 @@ class Note:
                     if had_media:
                         comment_media_sent += 1
                         pct = comment_media_sent / comment_with_media_count
-                        bar = _make_progress_bar(pct)
                         try:
                             await progress_msg.edit(
-                                f'💬 Sending comment media...\n{bar}  {comment_media_sent}/{comment_with_media_count}'
+                                _progress_text('💬 Sending comment media...', pct, f'{comment_media_sent}/{comment_with_media_count}', cm_start_time)
                             )
                         except MessageNotModifiedError:
                             pass
@@ -1358,6 +1620,16 @@ class Note:
             try:
                 # Read the current progress message text as base
                 current = (await bot.get_messages(chat_id, ids=progress_msg.id)).message or ''
+                # Save base text for later reconstruction by action handlers
+                try:
+                    fp = os.path.join('data', f'{msg_identifier}.json')
+                    with open(fp, 'r', encoding='utf-8') as f:
+                        saved = json.load(f)
+                    saved['summary_base_text'] = current
+                    with open(fp, 'w', encoding='utf-8') as f:
+                        json.dump(saved, f, indent=4, ensure_ascii=False)
+                except Exception:
+                    pass
                 footer = _build_summary_footer(
                     send_as_file=send_as_file,
                     include_live_videos=include_live_videos,
@@ -1367,8 +1639,17 @@ class Note:
                     anchor_comments_sent=anchor_comments_sent,
                     has_xsec_token=has_xsec_token,
                     media_too_large=total_media_bytes > AI_SUMMARY_MAX_MEDIA_BYTES,
+                    files_transfer_summary=saved.get('files_transfer_summary', ''),
+                    live_transfer_summary=saved.get('live_transfer_summary', ''),
                 )
-                await progress_msg.edit(current + footer, parse_mode='html')
+                # Build action buttons from saved data
+                try:
+                    with open(os.path.join('data', f'{msg_identifier}.json'), 'r', encoding='utf-8') as f:
+                        saved_data = json.load(f)
+                    btns = _action_buttons(saved_data)
+                except Exception:
+                    btns = None
+                await progress_msg.edit(current + footer, parse_mode='html', buttons=btns)
             except MessageNotModifiedError:
                 pass
             except Exception as e:
@@ -1400,11 +1681,12 @@ def _build_comment_html(comment: dict[str, Any], noteId: str, xsec_token: str = 
     nick = tg_msg_escape_html(comment['user'].get('nickname', ''))
     red_id = tg_msg_escape_html(comment['user'].get('red_id', ''))
     uid = comment['user']['userid']
-    ip = tg_msg_escape_html(comment['ip_location'])
+    _raw_ip = comment.get('ip_location', '')
     time_str = tg_msg_escape_html(convert_timestamp_to_timestr(comment['time']))
+    _ip_part = f' 📍 {tg_msg_escape_html(_raw_ip)}' if _raw_ip else ''
     text += (
-        f'❤️ {comment["like_count"]} 💬 {comment["sub_comment_count"]} '
-        f'📍 {ip} {get_time_emoji(comment["time"])} {time_str}\n'
+        f'❤️ {comment["like_count"]} 💬 {comment["sub_comment_count"]}'
+        f'{_ip_part} {get_time_emoji(comment["time"])} {time_str}\n'
     )
     cu_profile = f'https://www.xiaohongshu.com/user/profile/{uid}'
     if xsec_token:
@@ -1506,20 +1788,22 @@ async def _run_ai_summary(
         except Exception as e:
             bot_logger.debug(f"Failed to save ai_summary to JSON: {e}")
         try:
-            msg = await bot.get_messages(chat_id, ids=progress_msg_id)
-            if not msg or not msg.message:
-                return
-            text = msg.message
-            # Strip old footer
-            ai_marker = '\n✨ AI Summary'
-            idx = text.find(ai_marker)
-            if idx != -1:
-                text = text[:idx]
-            else:
-                marker = '\n🏷 Flags'
-                idx = text.find(marker)
+            base_text = data.get('summary_base_text', '')
+            if not base_text:
+                msg = await bot.get_messages(chat_id, ids=progress_msg_id)
+                if not msg or not msg.message:
+                    return
+                text = msg.message
+                ai_marker = '\n✨ AI Summary'
+                idx = text.find(ai_marker)
                 if idx != -1:
                     text = text[:idx]
+                else:
+                    marker = '\n🏷 Flags'
+                    idx = text.find(marker)
+                    if idx != -1:
+                        text = text[:idx]
+                base_text = text
             footer = _build_summary_footer(
                 send_as_file=flags.get('send_as_file', False),
                 include_live_videos=flags.get('include_live_videos', False),
@@ -1531,9 +1815,15 @@ async def _run_ai_summary(
                 anchor_comments_sent=data.get('anchor_comments_sent', False),
                 has_xsec_token=data.get('has_xsec_token', False),
                 media_too_large=data.get('total_media_bytes', 0) > AI_SUMMARY_MAX_MEDIA_BYTES,
+                files_transfer_summary=data.get('files_transfer_summary', ''),
+                live_transfer_summary=data.get('live_transfer_summary', ''),
             )
+            btns = _action_buttons(data)
             await asyncio.sleep(0.25)
-            await msg.edit(text + footer, parse_mode='html')
+            await bot.edit_message(
+                chat_id, progress_msg_id,
+                base_text + footer, parse_mode='html', buttons=btns,
+            )
         except MessageNotModifiedError:
             pass
         except Exception as e:
@@ -1594,42 +1884,8 @@ async def _run_ai_summary(
             pass
 
 
-# ── Bark notify ────────────────────────────────────────────────────────────────
-
-def bark_notify(message: str) -> None:
-    bark_token = os.getenv('BARK_TOKEN')
-    bark_key = os.getenv('BARK_KEY')
-    bark_iv = os.getenv('BARK_IV', '472')
-
-    if not bark_token:
-        bot_logger.warning('BARK_TOKEN not set, cannot send bark notification')
-        return
-
-    try:
-        if bark_key:
-            payload = json.dumps({"body": message, "sound": "birdsong", "title": "xhsfwbot"}, ensure_ascii=False)
-            if len(bark_key) != 32:
-                bot_logger.error(f'BARK_KEY must be exactly 32 characters long, got {len(bark_key)}')
-                requests.get(f'https://api.day.app/{bark_token}/{quote("xhsfwbot")}/{quote(message)}')
-                return
-            cipher = AES.new(bark_key.encode('utf-8'), AES.MODE_ECB)  # pyright: ignore
-            encrypted = cipher.encrypt(pad(payload.encode('utf-8'), AES.block_size))
-            ciphertext = base64.b64encode(encrypted).decode('utf-8')
-            response = requests.post(f'https://api.day.app/{bark_token}', data={'ciphertext': ciphertext, 'iv': bark_iv})
-            if response.status_code == 200:
-                bot_logger.info('Encrypted Bark notification sent successfully')
-            else:
-                bot_logger.error(f'Failed to send encrypted bark notification: {response.status_code} {response.text}')
-        else:
-            requests.get(f'https://api.day.app/{bark_token}/{quote("xhsfwbot")}/{quote(message)}')
-            bot_logger.info('Bark notification sent successfully')
-    except Exception as e:
-        bot_logger.error(f'Failed to send bark notification: {e}\n{traceback.format_exc()}')
-
-
 def restart_script() -> None:
     bot_logger.info("Restarting script...")
-    bark_notify("xhsfwbot is restarting.")
     try:
         process = psutil.Process(os.getpid())
         for handler in process.open_files() + process.net_connections():
@@ -1793,21 +2049,11 @@ def run_telegram_bot() -> None:
         )
         raise events.StopPropagation
 
-    # ── Reaction handler (🤔 AI summary / 👨‍💻 resend as file / 👀 send live photos) ──
-
-    def _check_reaction(update, emoticon: str) -> bool:
-        """Check if a specific emoticon is among the NEW reactions."""
-        return any(
-            (isinstance(r, ReactionEmoji) and r.emoticon == emoticon) or
-            (hasattr(r, 'reaction') and isinstance(r.reaction, ReactionEmoji) and r.reaction.emoticon == emoticon)
-            for r in (update.new_reactions or [])
-        )
-
     async def _update_summary_msg(
         bot_client: TelegramClient, chat_id: int,
         data: dict[str, Any], msg_file_path: str,
     ) -> None:
-        """Update the progress/summary message footer to reflect current reaction status."""
+        """Update the progress/summary message footer to reflect current action status."""
         progress_msg_id = data.get('progress_msg_id')
         if not progress_msg_id:
             return
@@ -1815,22 +2061,24 @@ def run_telegram_bot() -> None:
         reactions_used = data.get('reactions_used', {})
         has_live = data.get('has_live_photos', False)
         ai_summary = data.get('ai_summary', '')
+        base_text = data.get('summary_base_text', '')
         try:
-            msg = await bot_client.get_messages(chat_id, ids=progress_msg_id)
-            if not msg or not msg.message:
-                return
-            text = msg.message
-            # Strip old footer (AI summary + flags + reactions)
-            # AI summary marker comes first if present
-            ai_marker = '\n✨ AI Summary'
-            idx = text.find(ai_marker)
-            if idx != -1:
-                text = text[:idx]
-            else:
-                marker = '\n🏷 Flags'
-                idx = text.find(marker)
+            if not base_text:
+                msg = await bot_client.get_messages(chat_id, ids=progress_msg_id)
+                if not msg or not msg.message:
+                    return
+                text = msg.message
+                # Strip old footer
+                ai_marker = '\n✨ AI Summary'
+                idx = text.find(ai_marker)
                 if idx != -1:
                     text = text[:idx]
+                else:
+                    marker = '\n🏷 Flags'
+                    idx = text.find(marker)
+                    if idx != -1:
+                        text = text[:idx]
+                base_text = text
             footer = _build_summary_footer(
                 send_as_file=flags.get('send_as_file', False),
                 include_live_videos=flags.get('include_live_videos', False),
@@ -1842,248 +2090,500 @@ def run_telegram_bot() -> None:
                 anchor_comments_sent=data.get('anchor_comments_sent', False),
                 has_xsec_token=data.get('has_xsec_token', False),
                 media_too_large=data.get('total_media_bytes', 0) > AI_SUMMARY_MAX_MEDIA_BYTES,
+                files_transfer_summary=data.get('files_transfer_summary', ''),
+                live_transfer_summary=data.get('live_transfer_summary', ''),
             )
-            await msg.edit(text + footer, parse_mode='html')
+            btns = _action_buttons(data)
+            await bot_client.edit_message(
+                chat_id, progress_msg_id,
+                base_text + footer, parse_mode='html', buttons=btns,
+            )
         except MessageNotModifiedError:
             pass
         except Exception as e:
             bot_logger.debug(f"Failed to update summary footer: {e}")
 
-    @bot.on(events.Raw(UpdateBotMessageReaction))
-    async def reaction_handler(update) -> None:  # type: ignore[name-defined]
-        bot_logger.debug(f"Received reaction update: {update}")
+    # ── Callback query handler (replaces reaction-based control) ─────────────
 
-        has_thinking = _check_reaction(update, '🤔')
-        has_file = _check_reaction(update, '👨\u200d💻')
-        has_eyes = _check_reaction(update, '👀')
+    _action_busy: set[str] = set()
 
-        if not has_thinking and not has_file and not has_eyes:
+    async def _restore_summary(
+        bot_client: TelegramClient, chat_id: int, msg_id: int,
+        data: dict[str, Any],
+    ) -> None:
+        """Restore the progress/summary message after an action operation."""
+        base_text = data.get('summary_base_text', '')
+        if not base_text:
             return
-
-        try:
-            chat_id = get_peer_id(update.peer)
-            msg_id = update.msg_id
-            user_id = get_peer_id(update.actor) if update.actor else None
-        except Exception as e:
-            bot_logger.error(f"Failed to parse reaction update: {e}")
-            return
-
-        msg_file_path = os.path.join('data', f'{chat_id}.{msg_id}.json')
-        if not os.path.exists(msg_file_path):
-            bot_logger.debug(f"No data file for {chat_id}.{msg_id}, ignoring reaction")
-            return
-
-        # Load data and check if reaction was already used
-        with open(msg_file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        flags = data.get('flags', {})
         reactions_used = data.get('reactions_used', {})
+        has_live = data.get('has_live_photos', False)
+        ai_summary = data.get('ai_summary', '')
+        footer = _build_summary_footer(
+            send_as_file=flags.get('send_as_file', False),
+            include_live_videos=flags.get('include_live_videos', False),
+            use_xsec=flags.get('use_xsec', False),
+            has_live_photos=has_live,
+            reactions_used=reactions_used,
+            ai_summary=ai_summary,
+            has_anchor_comments=data.get('has_anchor_comments', False),
+            anchor_comments_sent=data.get('anchor_comments_sent', False),
+            has_xsec_token=data.get('has_xsec_token', False),
+            media_too_large=data.get('total_media_bytes', 0) > AI_SUMMARY_MAX_MEDIA_BYTES,
+            files_transfer_summary=data.get('files_transfer_summary', ''),
+            live_transfer_summary=data.get('live_transfer_summary', ''),
+        )
+        btns = _action_buttons(data)
+        try:
+            await bot_client.edit_message(
+                chat_id, msg_id,
+                base_text + footer, parse_mode='html', buttons=btns,
+            )
+        except MessageNotModifiedError:
+            pass
+        except Exception as e:
+            bot_logger.debug(f"Failed to restore summary: {e}")
 
-        # ── 👨‍💻 Resend media as files ─────────────────────────────────────────
-        if has_file:
-            bot_logger.info(f"User {user_id} reacted 👨‍💻 to message {msg_id} in {chat_id}")
-            if data.get('flags', {}).get('send_as_file'):
-                bot_logger.debug("Files already sent via -f flag, rejecting 👨‍💻")
-                await _set_reaction(bot, update.peer, msg_id, '🤷‍♂️')
+    @bot.on(events.CallbackQuery())
+    async def callback_handler(event: events.CallbackQuery.Event) -> None:
+        data_str = event.data.decode('utf-8') if event.data else ''
+        chat_id = event.chat_id
+        msg_id = event.message_id
+
+        # ── Progress control callbacks ────────────────────────────────────
+        if data_str in ('prog_pause', 'prog_resume', 'prog_cancel'):
+            key = f'{chat_id}.{msg_id}'
+            ctrl = _progress_controls.get(key)
+            if not ctrl:
+                await event.answer('⚠️ No active operation')
                 return
-            if reactions_used.get('file'):
-                bot_logger.debug("File reaction already used, ignoring")
-                return
-            await _set_reaction(bot, update.peer, msg_id, '👌')
-            try:
-                images_list = data.get('images_list', [])
-                video_url = data.get('video_url', '')
-
-                # Collect all media URLs with proper naming:
-                # photo_1, live_1, photo_2, photo_3 (no live), ...
-                all_urls: list[dict[str, str]] = []
-                photo_num = 0
-                pending_live: dict[str, str] | None = None
-                for img in images_list:
-                    if img.get('live'):
-                        # Live entry comes before its photo; hold it
-                        pending_live = {'url': img['url']}
-                    else:
-                        photo_num += 1
-                        all_urls.append({'url': img['url'], 'name': f'photo_{photo_num}.jpg'})
-                        if pending_live:
-                            all_urls.append({'url': pending_live['url'], 'name': f'live_{photo_num}.mp4'})
-                            pending_live = None
-                if video_url:
-                    all_urls.append({'url': video_url, 'name': 'video_1.mp4'})
-
-                if not all_urls:
-                    bot_logger.debug("No media URLs found for 👨‍💻 reaction")
-                    return
-
-                total = len(all_urls)
-                bar = _make_progress_bar(0)
-                prog_msg = await bot.send_message(
-                    chat_id,
-                    f'📥 Downloading files (0/{total})...\n{bar}',
-                    reply_to=msg_id, silent=True,
-                )
-
-                all_files: list[BytesIO] = []
-                total_bytes = 0
-                dl_start = time.monotonic()
-                dl_last_edit = time.monotonic()
-                for idx, item in enumerate(all_urls):
-                    resp = requests.get(item['url'])
-                    bio = BytesIO(resp.content)
-                    bio.name = item['name']
-                    all_files.append(bio)
-                    total_bytes += len(resp.content)
-
-                    # Update download progress (throttled to every 2s, always update on last)
-                    now = time.monotonic()
-                    if now - dl_last_edit >= 2 or idx == total - 1:
-                        dl_last_edit = now
-                        pct = (idx + 1) / total
-                        bar = _make_progress_bar(pct)
-                        dl_mb = total_bytes / (1024 * 1024)
-                        try:
-                            await prog_msg.edit(
-                                f'📥 Downloading files ({idx + 1}/{total})...\n{bar}  {dl_mb:.1f} MB'
-                            )
-                        except MessageNotModifiedError:
-                            pass
-
-                dl_elapsed = time.monotonic() - dl_start
-                total_mb = total_bytes / (1024 * 1024)
-
-                # Upload phase
+            if data_str == 'prog_pause':
+                ctrl.pause()
+                await event.answer('⏸ Paused')
                 try:
-                    await prog_msg.edit(
-                        f'📤 Uploading {total} file(s) ({total_mb:.1f} MB)...\n{_make_progress_bar(0)}'
-                    )
-                except MessageNotModifiedError:
-                    pass
-
-                ul_start = time.monotonic()
-                ul_last_edit = time.monotonic()
-
-                # Track cumulative upload progress across batches
-                batches = list(range(0, len(all_files), 10))
-                files_uploaded = 0
-
-                for batch_idx, i in enumerate(batches):
-                    batch = all_files[i:i + 10]
-                    batch_size = sum(b.getbuffer().nbytes for b in batch)
-
-                    async def _file_react_upload_progress(current: int, total_up: int) -> None:
-                        nonlocal ul_last_edit
-                        now = time.monotonic()
-                        if now - ul_last_edit < 2:
-                            return
-                        ul_last_edit = now
-                        # Approximate overall progress
-                        done_bytes = sum(b.getbuffer().nbytes for b in all_files[:files_uploaded])
-                        overall_pct = (done_bytes + current) / total_bytes if total_bytes else 0
-                        bar = _make_progress_bar(overall_pct)
-                        cur_mb = (done_bytes + current) / (1024 * 1024)
-                        try:
-                            await prog_msg.edit(
-                                f'📤 Uploading {total} file(s) ({total_mb:.1f} MB)...\n{bar}  {cur_mb:.1f}/{total_mb:.1f} MB'
-                            )
-                        except MessageNotModifiedError:
-                            pass
-
-                    await bot.send_file(
-                        chat_id, batch,
-                        reply_to=msg_id, silent=True,
-                        force_document=True,
-                        progress_callback=_file_react_upload_progress,
-                    )
-                    files_uploaded += len(batch)
-
-                ul_elapsed = time.monotonic() - ul_start
-                bot_logger.info(f"Sent {len(all_files)} file(s) via 👨‍💻 reaction")
-
-                # Delete progress message
-                try:
-                    await prog_msg.delete()
+                    msg = await bot.get_messages(chat_id, ids=msg_id)
+                    if msg and msg.message:
+                        lines = msg.message.split('\n')
+                        pct_val = 0.0
+                        for ln in lines:
+                            if '█' in ln or '░' in ln:
+                                filled = ln.count('█')
+                                total_w = filled + ln.count('░')
+                                pct_val = filled / total_w if total_w else 0
+                                break
+                        await msg.edit(
+                            _progress_text('', pct_val, paused=True),
+                            buttons=_progress_buttons(paused=True),
+                        )
                 except Exception:
                     pass
-
-                # Mark reaction as used and update summary
-                data['reactions_used']['file'] = True
-                with open(msg_file_path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, indent=4, ensure_ascii=False)
-                await _update_summary_msg(bot, chat_id, data, msg_file_path)
-            except Exception as e:
-                bot_logger.error(f"Failed to resend media as files (👨‍💻): {e}\n{traceback.format_exc()}")
+            elif data_str == 'prog_resume':
+                ctrl.resume()
+                await event.answer('▶️ Resumed')
+            elif data_str == 'prog_cancel':
+                ctrl.cancel()
+                await event.answer('❌ Cancelling...')
             return
 
-        # ── 👀 Send missing live photos as videos ─────────────────────────────
-        if has_eyes:
-            bot_logger.info(f"User {user_id} reacted 👀 to message {msg_id} in {chat_id}")
-            if data.get('flags', {}).get('include_live_videos'):
-                bot_logger.debug("Live photos already included via -l flag, rejecting 👀")
-                await _set_reaction(bot, update.peer, msg_id, '🤷‍♂️')
-                return
-            if reactions_used.get('eyes'):
-                bot_logger.debug("Eyes reaction already used, ignoring")
-                return
-            try:
-                images_list = data.get('images_list', [])
+        # ── Action callbacks ──────────────────────────────────────────────
+        if not data_str.startswith('act_'):
+            return
+        parts = data_str.split(':', 1)
+        if len(parts) != 2:
+            await event.answer('⚠️ Invalid action')
+            return
+        action_type, primary_id = parts[0], parts[1]
 
-                live_urls = [img['url'] for img in images_list if img.get('live')]
-                if not live_urls:
-                    bot_logger.debug("No live photo URLs found for 👀 reaction")
-                    await _set_reaction(bot, update.peer, msg_id, '🤷‍♂️')
-                    return
-
-                await _set_reaction(bot, update.peer, msg_id, '👌')
-
-                live_files: list[BytesIO] = []
-                for idx, url in enumerate(live_urls):
-                    resp = requests.get(url)
-                    bio = BytesIO(resp.content)
-                    bio.name = f'live_{idx + 1}.mp4'
-                    live_files.append(bio)
-
-                for i in range(0, len(live_files), 10):
-                    batch = live_files[i:i + 10]
-                    await bot.send_file(
-                        chat_id, batch,
-                        reply_to=msg_id, silent=True,
-                    )
-                bot_logger.info(f"Sent {len(live_files)} live photo video(s) via 👀 reaction")
-
-                # Mark reaction as used and update summary
-                data['reactions_used']['eyes'] = True
-                with open(msg_file_path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, indent=4, ensure_ascii=False)
-                await _update_summary_msg(bot, chat_id, data, msg_file_path)
-            except Exception as e:
-                bot_logger.error(f"Failed to send live photos (👀): {e}\n{traceback.format_exc()}")
+        msg_file_path = os.path.join('data', f'{primary_id}.json')
+        if not os.path.exists(msg_file_path):
+            await event.answer('⚠️ Data not found')
             return
 
-        # ── 🤔 AI summary ────────────────────────────────────────────────────
-        bot_logger.info(f"User {user_id} reacted 🤔 to message {msg_id} in {chat_id}")
-        if reactions_used.get('thinking'):
-            bot_logger.debug("Thinking reaction already used, ignoring")
+        if primary_id in _action_busy:
+            await event.answer('⚠️ Another action in progress')
             return
 
-        # Reject if media is too large for AI processing
-        if data.get('total_media_bytes', 0) > AI_SUMMARY_MAX_MEDIA_BYTES:
-            bot_logger.info("Media too large for AI summary, rejecting 🤔 reaction")
-            await _set_reaction(bot, update.peer, msg_id, '🤷‍♂️')
+        with open(msg_file_path, 'r', encoding='utf-8') as f:
+            note_data = json.load(f)
+
+        reaction_key = {'act_files': 'file', 'act_live': 'eyes', 'act_ai': 'thinking'}.get(action_type)
+        if not reaction_key:
+            await event.answer('⚠️ Unknown action')
             return
 
-        # Set 👾 reaction
-        await _set_reaction(bot, update.peer, msg_id, '👾')
+        # Mark action as used IMMEDIATELY (button won't come back even if aborted)
+        note_data.setdefault('reactions_used', {})[reaction_key] = True
+        with open(msg_file_path, 'w', encoding='utf-8') as f:
+            json.dump(note_data, f, indent=4, ensure_ascii=False)
 
-        # Mark reaction as used before running
-        data['reactions_used']['thinking'] = True
+        # Update buttons immediately (remove the clicked action)
+        btns = _action_buttons(note_data)
         try:
+            cur_msg = await bot.get_messages(chat_id, ids=msg_id)
+            if cur_msg:
+                await cur_msg.edit(cur_msg.message, buttons=btns, parse_mode='html')
+        except MessageNotModifiedError:
+            pass
+        except Exception:
+            pass
+
+        await event.answer()
+
+        _action_busy.add(primary_id)
+        try:
+            if action_type == 'act_files':
+                await _handle_files_action(chat_id, msg_id, note_data, msg_file_path)
+            elif action_type == 'act_live':
+                await _handle_live_action(chat_id, msg_id, note_data, msg_file_path)
+            elif action_type == 'act_ai':
+                await _handle_ai_action(chat_id, msg_id, note_data, msg_file_path)
+        finally:
+            _action_busy.discard(primary_id)
+
+    # ── Action: resend media as files ─────────────────────────────────────────
+
+    async def _handle_files_action(
+        chat_id: int, prog_msg_id: int,
+        data: dict[str, Any], msg_file_path: str,
+    ) -> None:
+        images_list = data.get('images_list', [])
+        video_url = data.get('video_url', '')
+
+        is_video_note = bool(video_url)
+        all_urls: list[dict[str, str]] = []
+        photo_num = 0
+        pending_live: dict[str, str] | None = None
+        for img in images_list:
+            if img.get('live'):
+                pending_live = {'url': img['url']}
+            else:
+                photo_num += 1
+                name = 'cover.jpg' if is_video_note else f'photo_{photo_num}.jpg'
+                all_urls.append({'url': img['url'], 'name': name})
+                if pending_live:
+                    all_urls.append({'url': pending_live['url'], 'name': f'live_{photo_num}.mp4'})
+                    pending_live = None
+        if video_url:
+            all_urls.append({'url': video_url, 'name': 'video.mp4'})
+
+        if not all_urls:
+            bot_logger.debug("No media URLs found for files action")
+            await _restore_summary(bot, chat_id, prog_msg_id, data)
+            return
+
+        total = len(all_urls)
+        # Send a NEW progress message instead of overwriting the summary
+        act_prog = await bot.send_message(
+            chat_id,
+            _progress_text(f'📥 Downloading files (0/{total})...', 0),
+            reply_to=prog_msg_id, silent=True,
+            buttons=_progress_buttons(),
+        )
+        ctrl = _ProgressControl(chat_id)
+        ctrl_key = f'{chat_id}.{act_prog.id}'
+        _progress_controls[ctrl_key] = ctrl
+
+        try:
+            all_files: list[BytesIO] = []
+            total_bytes = 0
+            dl_start = time.monotonic()
+            dl_last_edit = time.monotonic()
+            for idx, item in enumerate(all_urls):
+                await ctrl.check()
+                resp = requests.get(item['url'])
+                bio = BytesIO(resp.content)
+                bio.name = item['name']
+                all_files.append(bio)
+                total_bytes += len(resp.content)
+
+                now = time.monotonic()
+                if now - dl_last_edit >= 2 or idx == total - 1:
+                    dl_last_edit = now
+                    pct = (idx + 1) / total
+                    dl_mb = total_bytes / (1024 * 1024)
+                    try:
+                        await act_prog.edit(
+                            _progress_text(f'📥 Downloading files ({idx + 1}/{total})...',
+                                           pct, f'{dl_mb:.1f} MB', dl_start,
+                                           transferred_bytes=total_bytes),
+                            buttons=_progress_buttons(),
+                        )
+                    except MessageNotModifiedError:
+                        pass
+
+            dl_elapsed = time.monotonic() - dl_start
+            total_mb = total_bytes / (1024 * 1024)
+            _dl_spd = _speed_str(dl_elapsed, total_bytes)
+            dl_summary = f'📥 Download: {dl_elapsed:.1f}s'
+            if _dl_spd:
+                dl_summary += f' ({_dl_spd})'
+            try:
+                await act_prog.edit(
+                    f'{dl_summary}\n' + _progress_text(f'📤 Uploading {total} file(s) ({total_mb:.1f} MB)...', 0),
+                    buttons=_progress_buttons(),
+                )
+            except MessageNotModifiedError:
+                pass
+
+            ul_start = time.monotonic()
+            ul_last_edit = time.monotonic()
+            uploaded_files = []
+            _completed_bytes = 0
+            for fi, bio in enumerate(all_files):
+                await ctrl.check()
+                file_size = bio.getbuffer().nbytes
+                _file_completed = _completed_bytes
+
+                async def _file_up_progress(current: int, total_up: int,
+                                            _base=_file_completed) -> None:
+                    nonlocal ul_last_edit
+                    if ctrl.paused or ctrl.cancelled:
+                        return
+                    now = time.monotonic()
+                    if now - ul_last_edit < 2:
+                        return
+                    ul_last_edit = now
+                    overall = _base + current
+                    overall_pct = overall / total_bytes if total_bytes else 0
+                    cur_mb = overall / (1024 * 1024)
+                    try:
+                        await act_prog.edit(
+                            f'{dl_summary}\n' + _progress_text(
+                                f'📤 Uploading {total} file(s) ({total_mb:.1f} MB)...',
+                                overall_pct, f'{cur_mb:.1f}/{total_mb:.1f} MB',
+                                ul_start, transferred_bytes=overall),
+                            buttons=_progress_buttons(),
+                        )
+                    except MessageNotModifiedError:
+                        pass
+
+                input_file = await bot.upload_file(
+                    bio, progress_callback=_file_up_progress,
+                )
+                uploaded_files.append(input_file)
+                _completed_bytes += file_size
+
+            for i in range(0, len(uploaded_files), 10):
+                batch = uploaded_files[i:i + 10]
+                await bot.send_file(
+                    chat_id, batch,
+                    reply_to=prog_msg_id, silent=True,
+                    force_document=True,
+                )
+
+            ul_elapsed = time.monotonic() - ul_start
+            _ul_spd = _speed_str(ul_elapsed, total_bytes)
+
+            # Build transfer summary for the main summary message
+            _parts = [f'📥 {dl_elapsed:.1f}s']
+            if _dl_spd:
+                _parts[0] += f' ({_dl_spd})'
+            _parts.append(f'📤 {ul_elapsed:.1f}s')
+            if _ul_spd:
+                _parts[1] += f' ({_ul_spd})'
+            data['files_transfer_summary'] = '\n'.join(_parts)
+
+            bot_logger.info(f"Sent {len(all_files)} file(s) via Files action")
             with open(msg_file_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=4, ensure_ascii=False)
-        except Exception as e:
-            bot_logger.debug(f"Failed to pre-save thinking reaction state: {e}")
+            try:
+                await act_prog.delete()
+            except Exception:
+                pass
+            await _restore_summary(bot, chat_id, prog_msg_id, data)
 
-        # Run AI summary — edits the progress/summary message in-place
-        await _run_ai_summary(bot, gemini_client, chat_id, msg_id, msg_file_path, data)
+        except _OperationCancelled:
+            bot_logger.info("Files action cancelled")
+            data.setdefault('reactions_used', {})['file'] = 'cancelled'
+            with open(msg_file_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+            try:
+                await act_prog.delete()
+            except Exception:
+                pass
+            await _restore_summary(bot, chat_id, prog_msg_id, data)
+        except Exception as e:
+            bot_logger.error(f"Failed to send files: {e}\n{traceback.format_exc()}")
+            try:
+                await act_prog.delete()
+            except Exception:
+                pass
+            await _restore_summary(bot, chat_id, prog_msg_id, data)
+        finally:
+            _progress_controls.pop(ctrl_key, None)
+
+    # ── Action: send live photos as videos ────────────────────────────────────
+
+    async def _handle_live_action(
+        chat_id: int, prog_msg_id: int,
+        data: dict[str, Any], msg_file_path: str,
+    ) -> None:
+        images_list = data.get('images_list', [])
+
+        live_items: list[dict[str, str]] = []
+        photo_num = 0
+        pending_live_url: str | None = None
+        for img in images_list:
+            if img.get('live'):
+                pending_live_url = img['url']
+            else:
+                photo_num += 1
+                if pending_live_url:
+                    live_items.append({'url': pending_live_url, 'name': f'live_{photo_num}.mp4'})
+                    pending_live_url = None
+
+        if not live_items:
+            bot_logger.debug("No live photo URLs found for live action")
+            await _restore_summary(bot, chat_id, prog_msg_id, data)
+            return
+
+        total = len(live_items)
+        # Send a NEW progress message instead of overwriting the summary
+        act_prog = await bot.send_message(
+            chat_id,
+            _progress_text(f'📥 Downloading live photos (0/{total})...', 0),
+            reply_to=prog_msg_id, silent=True,
+            buttons=_progress_buttons(),
+        )
+        ctrl = _ProgressControl(chat_id)
+        ctrl_key = f'{chat_id}.{act_prog.id}'
+        _progress_controls[ctrl_key] = ctrl
+
+        try:
+            live_files: list[BytesIO] = []
+            total_bytes = 0
+            dl_start = time.monotonic()
+            dl_last_edit = time.monotonic()
+            for idx, item in enumerate(live_items):
+                await ctrl.check()
+                resp = requests.get(item['url'])
+                bio = BytesIO(resp.content)
+                bio.name = item['name']
+                live_files.append(bio)
+                total_bytes += len(resp.content)
+
+                now = time.monotonic()
+                if now - dl_last_edit >= 2 or idx == total - 1:
+                    dl_last_edit = now
+                    pct = (idx + 1) / total
+                    dl_mb = total_bytes / (1024 * 1024)
+                    try:
+                        await act_prog.edit(
+                            _progress_text(f'📥 Downloading live photos ({idx + 1}/{total})...',
+                                           pct, f'{dl_mb:.1f} MB', dl_start,
+                                           transferred_bytes=total_bytes),
+                            buttons=_progress_buttons(),
+                        )
+                    except MessageNotModifiedError:
+                        pass
+
+            dl_elapsed = time.monotonic() - dl_start
+            total_mb = total_bytes / (1024 * 1024)
+            _dl_spd = _speed_str(dl_elapsed, total_bytes)
+            dl_summary = f'📥 Download: {dl_elapsed:.1f}s'
+            if _dl_spd:
+                dl_summary += f' ({_dl_spd})'
+            try:
+                await act_prog.edit(
+                    f'{dl_summary}\n' + _progress_text(f'📤 Uploading {total} live photo(s) ({total_mb:.1f} MB)...', 0),
+                    buttons=_progress_buttons(),
+                )
+            except MessageNotModifiedError:
+                pass
+
+            ul_start = time.monotonic()
+            ul_last_edit = time.monotonic()
+            uploaded_files = []
+            _completed_bytes = 0
+            for fi, bio in enumerate(live_files):
+                await ctrl.check()
+                file_size = bio.getbuffer().nbytes
+                _file_completed = _completed_bytes
+
+                async def _live_up_progress(current: int, total_up: int,
+                                            _base=_file_completed) -> None:
+                    nonlocal ul_last_edit
+                    if ctrl.paused or ctrl.cancelled:
+                        return
+                    now = time.monotonic()
+                    if now - ul_last_edit < 2:
+                        return
+                    ul_last_edit = now
+                    overall = _base + current
+                    overall_pct = overall / total_bytes if total_bytes else 0
+                    cur_mb = overall / (1024 * 1024)
+                    try:
+                        await act_prog.edit(
+                            f'{dl_summary}\n' + _progress_text(
+                                f'📤 Uploading {total} live photo(s) ({total_mb:.1f} MB)...',
+                                overall_pct, f'{cur_mb:.1f}/{total_mb:.1f} MB',
+                                ul_start, transferred_bytes=overall),
+                            buttons=_progress_buttons(),
+                        )
+                    except MessageNotModifiedError:
+                        pass
+
+                input_file = await bot.upload_file(
+                    bio, progress_callback=_live_up_progress,
+                )
+                uploaded_files.append(input_file)
+                _completed_bytes += file_size
+
+            for i in range(0, len(uploaded_files), 10):
+                batch = uploaded_files[i:i + 10]
+                await bot.send_file(
+                    chat_id, batch,
+                    reply_to=prog_msg_id, silent=True,
+                )
+
+            bot_logger.info(f"Sent {len(live_files)} live photo(s) via Live Photos action")
+
+            # Build transfer summary for the main summary message
+            ul_elapsed = time.monotonic() - ul_start
+            _ul_spd = _speed_str(ul_elapsed, total_bytes)
+            _parts = [f'📥 {dl_elapsed:.1f}s']
+            if _dl_spd:
+                _parts[0] += f' ({_dl_spd})'
+            _parts.append(f'📤 {ul_elapsed:.1f}s')
+            if _ul_spd:
+                _parts[1] += f' ({_ul_spd})'
+            data['live_transfer_summary'] = '\n'.join(_parts)
+
+            with open(msg_file_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+            try:
+                await act_prog.delete()
+            except Exception:
+                pass
+            await _restore_summary(bot, chat_id, prog_msg_id, data)
+
+        except _OperationCancelled:
+            bot_logger.info("Live photos action cancelled")
+            data.setdefault('reactions_used', {})['eyes'] = 'cancelled'
+            with open(msg_file_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+            try:
+                await act_prog.delete()
+            except Exception:
+                pass
+            await _restore_summary(bot, chat_id, prog_msg_id, data)
+        except Exception as e:
+            bot_logger.error(f"Failed to send live photos: {e}\n{traceback.format_exc()}")
+            try:
+                await act_prog.delete()
+            except Exception:
+                pass
+            await _restore_summary(bot, chat_id, prog_msg_id, data)
+        finally:
+            _progress_controls.pop(ctrl_key, None)
+
+    # ── Action: AI summary ────────────────────────────────────────────────────
+
+    async def _handle_ai_action(
+        chat_id: int, prog_msg_id: int,
+        data: dict[str, Any], msg_file_path: str,
+    ) -> None:
+        await _run_ai_summary(bot, gemini_client, chat_id, prog_msg_id, msg_file_path, data)
 
     # ── Note processing (main message handler) ────────────────────────────────
 
@@ -2190,13 +2690,16 @@ def run_telegram_bot() -> None:
                 note_data['data'],
                 comment_list_data=comment_list_data['data'],
                 live=True,
-                telegraph=True,
                 telegraph_account=telegraph_account,
                 anchorCommentId=anchorCommentId,
                 xsec_token=xsec_token if use_xsec else '',
             )
             await note.initialize()
 
+            _prog_ctrl_key: str | None = None
+            # Extract original xhslink URL for abort buttons
+            _xhslink_match = re.search(r'https?://(?:www\.)?xhslink\.com/\S+', message_text)
+            _original_url = _xhslink_match.group(0) if _xhslink_match else ''
             try:
                 send_as_file = 'f' in flag_chars
                 include_live_videos = 'l' in flag_chars
@@ -2204,9 +2707,13 @@ def run_telegram_bot() -> None:
                 # Create early progress bar
                 progress_msg = await bot.send_message(
                     chat_id,
-                    f'📝 Creating Telegraph page...\n{_make_progress_bar(0)}',
+                    _progress_text('📝 Creating Telegraph page...', 0),
                     reply_to=msg_id, silent=True,
+                    buttons=_progress_buttons(),
                 )
+                _prog_ctrl = _ProgressControl(chat_id)
+                _prog_ctrl_key = f'{chat_id}.{progress_msg.id}'
+                _progress_controls[_prog_ctrl_key] = _prog_ctrl
                 tg_start = time.monotonic()
 
                 async with bot.action(chat_id, 'typing'):
@@ -2214,9 +2721,11 @@ def run_telegram_bot() -> None:
                         await note.to_telegraph()
 
                 tg_elapsed = time.monotonic() - tg_start
+                _tg_url = note.telegraph_url if hasattr(note, 'telegraph_url') else ''
                 try:
                     await progress_msg.edit(
-                        f'✅ Telegraph created ({tg_elapsed:.1f}s)\n📋 Preparing message...'
+                        f'✅ Telegraph created ({tg_elapsed:.1f}s)\n📋 Preparing message...',
+                        buttons=_progress_buttons(telegraph_url=_tg_url),
                     )
                 except MessageNotModifiedError:
                     pass
@@ -2225,7 +2734,8 @@ def run_telegram_bot() -> None:
 
                 try:
                     await progress_msg.edit(
-                        f'✅ Telegraph created ({tg_elapsed:.1f}s)\n📦 Sending media...'
+                        f'✅ Telegraph created ({tg_elapsed:.1f}s)\n📦 Sending media...',
+                        buttons=_progress_buttons(telegraph_url=_tg_url),
                     )
                 except MessageNotModifiedError:
                     pass
@@ -2237,6 +2747,9 @@ def run_telegram_bot() -> None:
                     progress_msg=progress_msg,
                     use_xsec=use_xsec,
                     has_xsec_token=bool(xsec_token),
+                    _progress_ctrl=_prog_ctrl,
+                    original_url=_original_url,
+                    anchor_comment_id=anchorCommentId,
                 )
 
                 # Delete user's original message
@@ -2245,12 +2758,29 @@ def run_telegram_bot() -> None:
                 except Exception as e:
                     bot_logger.debug(f"Failed to delete user message: {e}")
 
+            except _OperationCancelled:
+                bot_logger.info(f"Main flow cancelled by user for chat {chat_id}")
+                _tg_url = note.telegraph_url if hasattr(note, 'telegraph_url') else ''
+                try:
+                    await progress_msg.edit(
+                        '❌ Cancelled',
+                        buttons=_abort_url_buttons(noteId, anchorCommentId, xsec_token, _original_url, _tg_url),
+                    )
+                except Exception:
+                    pass
+                try:
+                    await bot.delete_messages(chat_id, msg_id)
+                except Exception:
+                    pass
             except Exception:
                 bot_logger.error(traceback.format_exc())
                 try:
                     await _set_reaction(bot, await event.get_input_chat(), msg_id, '😢')
                 except Exception:
                     pass
+            finally:
+                if _prog_ctrl_key:
+                    _progress_controls.pop(_prog_ctrl_key, None)
 
         except Exception as e:
             bot_logger.error(f"Error in note2feed: {e}\n{traceback.format_exc()}")
@@ -2342,7 +2872,6 @@ def run_telegram_bot() -> None:
                 note_data['data'],
                 comment_list_data={'data': {}},
                 live=True,
-                telegraph=True,
                 telegraph_account=telegraph_account,
                 anchorCommentId=anchorCommentId,
             )
@@ -2401,7 +2930,49 @@ def run_telegram_bot() -> None:
         await bot.start(bot_token=bot_token)
         me = await bot.get_me()
         bot_logger.info(f"Bot started as @{me.username} (id={me.id}) using Telethon (MTProto)")
-        bark_notify("xhsfwbot tries to start polling (Telethon).")
+
+        # Send startup info to admin
+        if admin_id:
+            try:
+                start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                uptime_s = ''
+                try:
+                    boot = datetime.fromtimestamp(psutil.boot_time())
+                    uptime = datetime.now() - boot
+                    days = uptime.days
+                    hours, rem = divmod(uptime.seconds, 3600)
+                    minutes = rem // 60
+                    uptime_s = f'{days}d {hours}h {minutes}m'
+                except Exception:
+                    uptime_s = 'N/A'
+                mem = psutil.virtual_memory()
+                disk = psutil.disk_usage(os.getcwd())
+                info_lines = [
+                    f'🚀 <b>xhsfwbot started</b>',
+                    f'',
+                    f'👤 <b>Bot:</b> @{me.username} (<code>{me.id}</code>)',
+                    f'📅 <b>Start time:</b> <code>{start_time}</code>',
+                    f'',
+                    f'🖥 <b>System</b>',
+                    f'  OS: <code>{platform.system()} {platform.release()}</code>',
+                    f'  Arch: <code>{platform.machine()}</code>',
+                    f'  Python: <code>{platform.python_version()}</code>',
+                    f'  Uptime: <code>{uptime_s}</code>',
+                    f'',
+                    f'📊 <b>Resources</b>',
+                    f'  CPU: <code>{psutil.cpu_count()} cores, {psutil.cpu_percent(interval=0.5):.0f}% used</code>',
+                    f'  RAM: <code>{mem.used / (1024**3):.1f}/{mem.total / (1024**3):.1f} GB ({mem.percent}%)</code>',
+                    f'  Disk: <code>{disk.used / (1024**3):.1f}/{disk.total / (1024**3):.1f} GB ({disk.percent}%)</code>',
+                    f'',
+                    f'⚙️ <b>Config</b>',
+                    f'  Proxy: <code>{telegram_proxy or "none"}</code>',
+                    f'  Log: <code>{logging_file}</code>',
+                    f'  PID: <code>{os.getpid()}</code>',
+                ]
+                await bot.send_message(admin_id, '\n'.join(info_lines), parse_mode='html', silent=True)
+            except Exception as e:
+                bot_logger.error(f"Failed to send startup info to admin: {e}")
+
         await bot.run_until_disconnected()
 
     asyncio.run(_main())
