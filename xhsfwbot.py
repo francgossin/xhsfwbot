@@ -41,6 +41,7 @@ from google.genai import types as genai_types
 from telethon import TelegramClient, events, Button
 from telethon.tl import functions, types as tl_types
 from telethon.tl.types import (
+    DocumentAttributeAudio,
     DocumentAttributeVideo,
     InputWebDocument,
     ReactionEmoji,
@@ -341,6 +342,15 @@ def extract_all_comments(json_data: dict[str, Any]) -> list[dict[str, Any]]:
 def convert_to_ogg_opus_pipe(input_bytes: bytes) -> bytes:
     process = subprocess.Popen(
         ["ffmpeg", "-i", "pipe:0", "-c:a", "libopus", "-f", "ogg", "pipe:1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    out, _ = process.communicate(input_bytes)
+    return out
+
+
+def convert_to_mp3_pipe(input_bytes: bytes) -> bytes:
+    process = subprocess.Popen(
+        ["ffmpeg", "-i", "pipe:0", "-vn", "-c:a", "libmp3lame", "-q:a", "3", "-f", "mp3", "pipe:1"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     out, _ = process.communicate(input_bytes)
@@ -959,13 +969,59 @@ class Note:
 
                 elif comment.get('audio_url', ''):
                     async with bot.action(chat_id, 'record-audio'):
-                        ogg = convert_to_ogg_opus_pipe(requests.get(comment['audio_url']).content)
-                        result = await bot.send_file(
-                            chat_id, ogg,
-                            caption=comment_html, parse_mode='html',
-                            reply_to=this_reply_id, silent=True,
-                            voice_note=True,
-                        )
+                        src_audio = requests.get(comment['audio_url']).content
+                        ogg = convert_to_ogg_opus_pipe(src_audio)
+                        mp3 = convert_to_mp3_pipe(src_audio)
+                        try:
+                            voice_io = BytesIO(ogg)
+                            voice_io.name = f'comment_{comment.get("id", "voice")}.ogg'
+                            result = await bot.send_file(
+                                chat_id, voice_io,
+                                caption=comment_html, parse_mode='html',
+                                reply_to=this_reply_id, silent=True,
+                                voice_note=True,
+                                attributes=[DocumentAttributeAudio(
+                                    duration=0,
+                                    voice=True,
+                                )],
+                            )
+                        except Exception as ve:
+                            bot_logger.warning(f"Voice-note send failed, fallback to music audio: {ve}")
+                            try:
+                                music_io = BytesIO(mp3 if mp3 else src_audio)
+                                music_io.name = f'comment_{comment.get("id", "voice")}.mp3'
+                                result = await bot.send_file(
+                                    chat_id, music_io,
+                                    caption=comment_html, parse_mode='html',
+                                    reply_to=this_reply_id, silent=True,
+                                    voice_note=False,
+                                    attributes=[DocumentAttributeAudio(
+                                        duration=0,
+                                        voice=False,
+                                        title='Comment Audio',
+                                        performer='xhsfwbot',
+                                    )],
+                                )
+                            except Exception as ae:
+                                bot_logger.warning(f"Music-audio send failed, fallback to file: {ae}")
+                                try:
+                                    file_io = BytesIO(mp3 if mp3 else (ogg if ogg else src_audio))
+                                    file_io.name = f'comment_{comment.get("id", "voice")}.mp3'
+                                    result = await bot.send_file(
+                                        chat_id, file_io,
+                                        caption=comment_html, parse_mode='html',
+                                        reply_to=this_reply_id, silent=True,
+                                        force_document=True,
+                                    )
+                                except Exception as fe:
+                                    bot_logger.warning(f"All audio send methods failed, fallback to text-only: {fe}")
+                                    result = await bot.send_message(
+                                        chat_id, comment_html,
+                                        parse_mode='html',
+                                        reply_to=this_reply_id, silent=True,
+                                        link_preview=False,
+                                    )
+
                         comment_id_to_msg_id[comment['id']] = result.id  # type: ignore[union-attr]
 
                 else:
