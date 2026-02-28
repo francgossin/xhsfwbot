@@ -82,11 +82,6 @@ logging.basicConfig(
 bot_logger = logging.getLogger("xhsfwbot")
 bot_logger.setLevel(logging.INFO)
 
-# Global variables for network monitoring
-last_successful_request = time.time()
-network_timeout_threshold = 120  # 2 minutes without successful requests triggers restart
-is_network_healthy = True
-
 # Concurrency control
 max_concurrent_requests = 5  # Maximum number of concurrent note processing
 processing_semaphore = asyncio.Semaphore(max_concurrent_requests)
@@ -114,10 +109,6 @@ def save_help_config(config: dict) -> None:
 
 help_config = load_help_config()
 
-# Auto restart configuration (in hours, default 24 hours, 0 to disable)
-auto_restart_interval = float(os.getenv('AUTO_RESTART_HOURS', '8'))
-bot_start_time = time.time()
-
 with open('redtoemoji.json', 'r', encoding='utf-8') as f:
     redtoemoji = json.load(f)
     f.close()
@@ -131,100 +122,6 @@ def replace_redemoji_with_emoji(text: str) -> str:
         text = text.replace(red_emoji, emoji)
     return text
 
-def check_network_connectivity() -> bool:
-    """Check if network connectivity is available by testing multiple endpoints"""
-    test_urls = [
-        "https://api.telegram.org",
-        "https://www.google.com", 
-        "https://1.1.1.1"
-    ]
-
-    # Check for pool timeout errors in recent log content
-    try:
-        with open(logging_file, 'r', encoding='utf-8') as log_str:
-            # Only read the last 50KB of log to avoid memory issues
-            log_str.seek(0, 2)  # Go to end of file
-            file_size = log_str.tell()
-            read_size = min(file_size, 50000)  # Read last 50KB
-            log_str.seek(max(0, file_size - read_size))
-            log_content = log_str.read()
-            
-            # Check for pool timeout error pattern
-            pool_timeout_patterns = [
-                "Pool timeout: All connections in the connection pool are occupied",
-                "Request was *not* sent to Telegram",
-                "networkloop: Network Retry Loop (Polling Updates): Timed out"
-            ]
-            
-            # Count occurrences in recent log
-            pool_timeout_count = sum(1 for pattern in pool_timeout_patterns if pattern in log_content)
-            if pool_timeout_count >= 2:
-                bot_logger.warning(f"Detected {pool_timeout_count} pool timeout indicators in recent logs")
-                return False
-    except Exception as e:
-        bot_logger.error(f"Error reading log file: {e}")
-
-    for url in test_urls:
-        try:
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                return True
-        except:
-            continue
-    return False
-
-def update_network_status(success: bool = True):
-    """Update the global network status tracking"""
-    global last_successful_request, is_network_healthy
-    if success:
-        last_successful_request = time.time()
-        is_network_healthy = True
-    else:
-        current_time = time.time()
-        if current_time - last_successful_request > network_timeout_threshold:
-            is_network_healthy = False
-            bark_notify("xhsfwbot network is unhealthy.")
-
-def network_monitor():
-    """Background network monitoring function"""
-    global is_network_healthy
-    while True:
-        try:
-            time.sleep(15)  # Check every 15 seconds
-            current_time = time.time()
-            if current_time - last_successful_request > network_timeout_threshold:
-                bot_logger.warning(f"No successful network requests for {network_timeout_threshold} seconds")
-                if not check_network_connectivity():
-                    bot_logger.error("Network connectivity test failed - triggering restart")
-                    is_network_healthy = False
-                    restart_script()
-                    break
-        except Exception as e:
-            bot_logger.error(f"Network monitor error: {e}")
-            time.sleep(10)
-
-def scheduled_restart_monitor():
-    """Background function to trigger scheduled restarts for memory management"""
-    if auto_restart_interval <= 0:
-        bot_logger.info("Scheduled auto-restart is disabled")
-        return
-    
-    restart_interval_seconds = auto_restart_interval * 3600
-    bot_logger.info(f"Scheduled auto-restart enabled: will restart every {auto_restart_interval} hours")
-    
-    while True:
-        try:
-            time.sleep(60)  # Check every minute
-            uptime = time.time() - bot_start_time
-            if uptime >= restart_interval_seconds:
-                bot_logger.info(f"Scheduled restart triggered after {uptime/3600:.2f} hours of uptime")
-                bark_notify(f"xhsfwbot scheduled restart after {uptime/3600:.1f}h uptime")
-                restart_script()
-                break
-        except Exception as e:
-            bot_logger.error(f"Scheduled restart monitor error: {e}")
-            time.sleep(60)
-
 class Note:
     def __init__(
             self,
@@ -232,9 +129,6 @@ class Note:
             comment_list_data: dict[str, Any],
             live: bool = False,
             telegraph: bool = False,
-            with_xsec_token: bool = False,
-            original_xsec_token: str = '',
-            with_full_data: bool = False,
             telegraph_account: Telegraph | None = None,
             anchorCommentId: str = ''
     ) -> None:
@@ -306,14 +200,6 @@ class Note:
                 )
         bot_logger.debug(f"Images found: {self.images_list}")
         self.url = get_clean_url(note_data['data'][0]['note_list'][0]['share_info']['link'])
-        self.with_xsec_token = with_xsec_token
-        if with_xsec_token:
-            if not original_xsec_token:
-                parsed_url = urlparse(str(note_data['data'][0]['note_list'][0]['share_info']['link']))
-                self.xsec_token = parse_qs(parsed_url.query)['xsec_token'][0]
-            else:
-                self.xsec_token = original_xsec_token
-            self.url += f"?xsec_token={self.xsec_token}"
         self.noteId = re.findall(r"[a-z0-9]{24}", self.url)[0]
         self.video_url = ''
         if 'video' in note_data['data'][0]['note_list'][0]:
@@ -375,7 +261,7 @@ class Note:
         for lines in self.desc.split('\n'):
             line_html = tg_msg_escape_html(lines)
             html += f'<blockquote>{line_html}</blockquote>'
-        html += f'<h4>👤 <a href="https://www.xiaohongshu.com/user/profile/{self.user["id"]}{f"?xsec_token={self.xsec_token}" if self.with_xsec_token else ""}"> @{self.user["name"]} ({self.user.get("red_id", "")})</a></h4>'
+        html += f'<h4>👤 <a href="https://www.xiaohongshu.com/user/profile/{self.user["id"]}"> @{self.user["name"]} ({self.user.get("red_id", "")})</a></h4>'
         html += f'<img src="{self.user["image"]}"></img>'
         html += f'<p>{get_time_emoji(self.time)} {convert_timestamp_to_timestr(self.time)}</p>'
         html += f'<p>❤️ {self.liked_count} ⭐ {self.collected_count} 💬 {self.comments_count} 🔗 {self.shared_count}</p>'
@@ -388,9 +274,9 @@ class Note:
         if self.comments:
             html += '<hr>'
             for i, comment in enumerate(self.comments):
-                html += f'<h4>💬 <a href="https://www.xiaohongshu.com/discovery/item/{self.noteId}?anchorCommentId={comment["id"]}{f"&xsec_token={self.xsec_token}" if self.with_xsec_token else ""}">Comment</a></h4>'
+                html += f'<h4>💬 <a href="https://www.xiaohongshu.com/discovery/item/{self.noteId}?anchorCommentId={comment["id"]}">Comment</a></h4>'
                 if 'target_comment' in comment:
-                    html += f'<p>↪️ <a href="https://www.xiaohongshu.com/user/profile/{comment["target_comment"]["user"]["userid"]}{f"?xsec_token={self.xsec_token}" if self.with_xsec_token else ""}"> {'@' + comment["target_comment"]["user"].get("nickname", "")} ({comment["target_comment"]["user"].get('red_id', '')})</a></p>'
+                    html += f'<p>↪️ <a href="https://www.xiaohongshu.com/user/profile/{comment["target_comment"]["user"]["userid"]}"> {'@' + comment["target_comment"]["user"].get("nickname", "")} ({comment["target_comment"]["user"].get('red_id', '')})</a></p>'
                 html += f'<p>{tg_msg_escape_html(replace_redemoji_with_emoji(comment["content"]))}</p>'
                 for pic in comment['pictures']:
                     if 'mp4' in pic:
@@ -400,12 +286,12 @@ class Note:
                 if comment.get('audio_url', ''):
                     html += f'<p><a href="{comment["audio_url"]}">🎤 Voice</a></p>'
                 html += f'<p>❤️ {comment["like_count"]} 💬 {comment["sub_comment_count"]}<br>📍 {tg_msg_escape_html(comment["ip_location"])}<br>{get_time_emoji(comment["time"])} {convert_timestamp_to_timestr(comment["time"])}</p>'
-                html += f'<p>👤 <a href="https://www.xiaohongshu.com/user/profile/{comment["user"]["userid"]}{f"?xsec_token={self.xsec_token}" if self.with_xsec_token else ""}"> {'@' + comment["user"].get("nickname", "")} ({comment["user"].get("red_id", "")})</a></p>'
+                html += f'<p>👤 <a href="https://www.xiaohongshu.com/user/profile/{comment["user"]["userid"]}"> {'@' + comment["user"].get("nickname", "")} ({comment["user"].get("red_id", "")})</a></p>'
                 for sub_comment in comment.get('sub_comments', []):
                     html += '<blockquote><blockquote>'
-                    html += f'<h4>💬 <a href="https://www.xiaohongshu.com/discovery/item/{self.noteId}?anchorCommentId={sub_comment["id"]}{f"&xsec_token={self.xsec_token}" if self.with_xsec_token else ""}">Comment</a></h4>'
+                    html += f'<h4>💬 <a href="https://www.xiaohongshu.com/discovery/item/{self.noteId}?anchorCommentId={sub_comment["id"]}">Comment</a></h4>'
                     if 'target_comment' in sub_comment:
-                        html += f'<br><p>  ↪️  <a href="https://www.xiaohongshu.com/user/profile/{sub_comment["target_comment"]["user"]["userid"]}{f"?xsec_token={self.xsec_token}" if self.with_xsec_token else ""}"> {'@' + sub_comment["target_comment"]["user"].get("nickname", "")} ({sub_comment["target_comment"]["user"].get("red_id", "")})</a></p>'
+                        html += f'<br><p>  ↪️  <a href="https://www.xiaohongshu.com/user/profile/{sub_comment["target_comment"]["user"]["userid"]}"> {'@' + sub_comment["target_comment"]["user"].get("nickname", "")} ({sub_comment["target_comment"]["user"].get("red_id", "")})</a></p>'
                     html += f'<br><p>{tg_msg_escape_html(replace_redemoji_with_emoji(sub_comment["content"]))}</p>'
                     for pic in sub_comment['pictures']:
                         if 'mp4' in pic:
@@ -415,7 +301,7 @@ class Note:
                     if sub_comment.get('audio_url', ''):
                         html += f'<br><p><a href="{sub_comment["audio_url"]}">🎤 Voice</a></p>'
                     html += f'<br><p>❤️ {sub_comment["like_count"]} 💬 {sub_comment["sub_comment_count"]}<br>📍 {tg_msg_escape_html(sub_comment["ip_location"])}<br>{get_time_emoji(sub_comment["time"])} {convert_timestamp_to_timestr(sub_comment["time"])}</p>'
-                    html += f'<br><p>👤 <a href="https://www.xiaohongshu.com/user/profile/{sub_comment["user"]["userid"]}{f"?xsec_token={self.xsec_token}" if self.with_xsec_token else ""}"> {'@' + sub_comment["user"].get("nickname", "")} ({sub_comment["user"].get("red_id", "")})</a></p>'
+                    html += f'<br><p>👤 <a href="https://www.xiaohongshu.com/user/profile/{sub_comment["user"]["userid"]}"> {'@' + sub_comment["user"].get("nickname", "")} ({sub_comment["user"].get("red_id", "")})</a></p>'
                     html += '</blockquote></blockquote>'
                 if i != len(self.comments) - 1:
                     html += f'<hr>'
@@ -666,14 +552,14 @@ class Note:
         if self.comments_with_context:
             for _, comment in enumerate(self.comments_with_context):
                 comment_text = ''
-                comment_text += f'💬 [Comment](https://www.xiaohongshu.com/discovery/item/{self.noteId}?anchorCommentId={comment["id"]}{f"&xsec_token={self.xsec_token}" if self.with_xsec_token else ""})'
+                comment_text += f'💬 [Comment](https://www.xiaohongshu.com/discovery/item/{self.noteId}?anchorCommentId={comment["id"]})'
                 if 'target_comment' in comment:
-                    comment_text += f'\n↪️ [@{tg_msg_escape_markdown_v2(comment["target_comment"]["user"].get("nickname", ""))} \\({tg_msg_escape_markdown_v2(comment["target_comment"]["user"].get('red_id', ''))}\\)](https://www.xiaohongshu.com/user/profile/{comment["target_comment"]["user"]["userid"]}{f"?xsec_token={self.xsec_token}" if self.with_xsec_token else ""})\n'
+                    comment_text += f'\n↪️ [@{tg_msg_escape_markdown_v2(comment["target_comment"]["user"].get("nickname", ""))} \\({tg_msg_escape_markdown_v2(comment["target_comment"]["user"].get('red_id', ''))}\\)](https://www.xiaohongshu.com/user/profile/{comment["target_comment"]["user"]["userid"]})\n'
                 else:
                     comment_text += '\n'
                 comment_text += f'{make_block_quotation(replace_redemoji_with_emoji(comment["content"]))}\n'
                 comment_text += f'❤️ {comment["like_count"]} 💬 {comment["sub_comment_count"]} 📍 {tg_msg_escape_markdown_v2(comment["ip_location"])} {get_time_emoji(comment["time"])} {tg_msg_escape_markdown_v2(convert_timestamp_to_timestr(comment["time"]))}\n'
-                comment_text += f'👤 [@{tg_msg_escape_markdown_v2(comment["user"].get("nickname", ""))} \\({tg_msg_escape_markdown_v2(comment["user"].get('red_id', ''))}\\)](https://www.xiaohongshu.com/user/profile/{comment["user"]["userid"]}{f"?xsec_token={self.xsec_token}" if self.with_xsec_token else ""})'
+                comment_text += f'👤 [@{tg_msg_escape_markdown_v2(comment["user"].get("nickname", ""))} \\({tg_msg_escape_markdown_v2(comment["user"].get('red_id', ''))}\\)](https://www.xiaohongshu.com/user/profile/{comment["user"]["userid"]})'
                 bot_logger.debug(f"Sending comment:\n{comment_text}")
                 if 'target_comment' in comment and _ > 0:
                     reply_id = comment_id_to_message_id[comment['target_comment']['id']].message_id
@@ -959,10 +845,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat:
         try:
             await context.bot.send_message(chat_id=chat.id, text="I'm xhsfwbot, please send me a xhs link!\n/help for more info.")
-            update_network_status(success=True)
         except Exception as e:
             bot_logger.error(f"Failed to send start message: {e}")
-            update_network_status(success=False)
 
 async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
@@ -977,7 +861,6 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=chat.id,
                     text=help_config['text']
                 )
-                update_network_status(success=True)
             elif help_config.get('type') == 'forward':
                 # Copy (not forward) so the original sender name is not shown
                 await context.bot.copy_message(
@@ -986,7 +869,6 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     message_id=help_config['message_id'],
                     disable_notification=True
                 )
-                update_network_status(success=True)
             else:
                 await context.bot.send_message(
                     chat_id=chat.id,
@@ -994,7 +876,6 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         except Exception as e:
             bot_logger.error(f"Failed to send help message: {e}")
-            update_network_status(success=False)
 
 async def sethelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: set the help message sent by /help.
@@ -1547,7 +1428,6 @@ async def _note2feed_internal(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             bot_logger.error(f"Failed to decode QR code: {e}")
 
-    with_xsec_token = bool(re.search(r"[^\S]+-x(?!\S)", message_text))
     url_info = get_url_info(message_text)
     if not url_info['success']:
         return
@@ -1634,8 +1514,6 @@ async def _note2feed_internal(update: Update, context: ContextTypes.DEFAULT_TYPE
             comment_list_data=comment_list_data['data'],
             live=True,
             telegraph=True,
-            with_xsec_token=with_xsec_token,
-            original_xsec_token=xsec_token,
             telegraph_account=telegraph_account,
             anchorCommentId=anchorCommentId
         )
@@ -1679,7 +1557,6 @@ async def _note2feed_internal(update: Update, context: ContextTypes.DEFAULT_TYPE
             await note.send_as_telegram_message(context.bot, chat.id, msg.message_id)
             if telegraph_msg:
                 await telegraph_msg.delete()
-            update_network_status(success=True)  # Successfully sent message
             
             # Delete user's original message after successful parsing
             try:
@@ -1743,7 +1620,6 @@ async def _inline_note2feed_internal(update: Update, context: ContextTypes.DEFAU
         return
     
 
-    with_xsec_token = bool(re.search(r"[^\S]+-x(?!\S)", message_text))
     url_info = get_url_info(message_text)
     if not url_info['success']:
         return
@@ -1824,7 +1700,7 @@ async def _inline_note2feed_internal(update: Update, context: ContextTypes.DEFAU
                         prefer_large_media=False
                     ),
                 ),
-                description=f"Telegraph URL with xiaohongshu.com URL ({'with' if with_xsec_token else 'no'} xsec_token)",
+                description="Telegraph URL with xiaohongshu.com URL",
                 thumbnail_url=note.thumbnail
             )
         ]
@@ -1832,10 +1708,8 @@ async def _inline_note2feed_internal(update: Update, context: ContextTypes.DEFAU
             inline_query_id=inline_query.id,
             results=inline_query_result
         )
-        update_network_status(success=True)
     except Exception as e:
         bot_logger.error(f"Error in inline_note2feed: {e}\n{traceback.format_exc()}")
-        update_network_status(success=False)
     return
 
 async def error_handler(update: Any, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1843,19 +1717,12 @@ async def error_handler(update: Any, context: ContextTypes.DEFAULT_TYPE) -> None
     admin_id = os.getenv('ADMIN_ID')
     error_str = str(context.error).lower()
     
-    # Check for pool timeout - this is critical and should trigger immediate restart
-    if 'pool timeout' in error_str or 'all connections in the connection pool are occupied' in error_str:
-        bot_logger.error(f"CRITICAL: Pool timeout detected - triggering immediate restart:\n{context.error}")
-        bark_notify("xhsfwbot: Pool timeout detected, restarting immediately")
-        restart_script()
-        return
-    
-    # Check for network-related errors that should trigger restart
+    # Check for network-related errors — just log them, let PTB's retry logic handle recovery
     network_keywords = [
-        'timeout', 'connection', 'network', 
+        'timeout', 'connection', 'network',
         'timed out', 'connecttimeout', 'readtimeout', 'writetimeout'
     ]
-    
+
     if isinstance(context.error, NetworkError) or any(keyword in error_str for keyword in network_keywords):
         # Format full traceback with the chained cause so the exact httpx call site is visible
         tb = traceback.format_exc()
@@ -1871,10 +1738,6 @@ async def error_handler(update: Any, context: ContextTypes.DEFAULT_TYPE) -> None
             f"--- Traceback ---\n{tb}"
             f"{cause_tb}"
         )
-        update_network_status(success=False)
-        if not is_network_healthy or not check_network_connectivity():
-            bot_logger.error("Network appears unhealthy - triggering restart")
-            restart_script()
         return
     elif isinstance(context.error, BadRequest):
         bot_logger.error(f"BadRequest error:\n{context.error}\n\n{traceback.format_exc()}")
@@ -1892,24 +1755,14 @@ async def error_handler(update: Any, context: ContextTypes.DEFAULT_TYPE) -> None
                     document=logging_file,
                     disable_notification=True
                 )
-                update_network_status(success=True)  # Successfully sent message
             except Exception as send_error:
                 bot_logger.error(f"Failed to send error report: {send_error}")
-                update_network_status(success=False)
         bot_logger.error(f"Update {update} caused error:\n{context.error}\n\n{traceback.format_exc()}")
 
 def run_telegram_bot():
     bot_token = os.getenv('BOT_TOKEN')
     if not bot_token:
         raise ValueError("BOT_TOKEN environment variable is required")
-    
-    # Start network monitoring in background thread
-    monitor_thread = threading.Thread(target=network_monitor, daemon=True)
-    monitor_thread.start()
-    
-    # Start scheduled restart monitor in background thread
-    restart_thread = threading.Thread(target=scheduled_restart_monitor, daemon=True)
-    restart_thread.start()
     
     application = ApplicationBuilder()\
         .concurrent_updates(True)\
@@ -1933,10 +1786,6 @@ def run_telegram_bot():
         application.add_handler(sethelp_handler)
         clearhelp_handler = CommandHandler("clearhelp", clearhelp)
         application.add_handler(clearhelp_handler)
-        
-        # AI summary button callback handler disabled
-        # AI_summary_button_callback_handler = CallbackQueryHandler(AI_summary_button_callback)
-        # application.add_handler(AI_summary_button_callback_handler)
         
         # Message reaction handler for AI summary
         reaction_handler = MessageReactionHandler(handle_message_reaction)
@@ -1983,23 +1832,9 @@ def run_telegram_bot():
         raise Exception('KeyboardInterrupt received, script will quit now.')
     except NetworkError as e:
         bot_logger.error(f'NetworkError: {e}\n{traceback.format_exc()}')
-        update_network_status(success=False)
-        if not check_network_connectivity():
-            bot_logger.error('Network connectivity test failed - restarting')
-            restart_script()
         raise Exception('NetworkError received, script will quit now.')
     except Exception as e:
-        error_str = str(e).lower()
-        network_keywords = ['timeout', 'connection', 'network', 'timed out']
-        
-        if any(keyword in error_str for keyword in network_keywords):
-            bot_logger.error(f'Network-related error in main loop: {e}\n{traceback.format_exc()}')
-            update_network_status(success=False)
-            if not check_network_connectivity():
-                bot_logger.error('Network connectivity test failed - restarting')
-                restart_script()
-        else:
-            bot_logger.error(f'Unexpected error:\n{traceback.format_exc()}\n\n SCRIPT WILL QUIT NOW')
+        bot_logger.error(f'Unexpected error:\n{traceback.format_exc()}\n\n SCRIPT WILL QUIT NOW')
         raise Exception(f'Error in main loop: {e}')
 
 def bark_notify(message: str) -> None:
@@ -2067,7 +1902,7 @@ def bark_notify(message: str) -> None:
 def restart_script():
     bot_logger.info("Restarting script...")
     # notify bot owner with bark
-    bark_notify("xhsfwbot is restarting due to network issues.")
+    bark_notify("xhsfwbot is restarting.")
     try:
         process = psutil.Process(os.getpid())
         for handler in process.open_files() + process.net_connections():
