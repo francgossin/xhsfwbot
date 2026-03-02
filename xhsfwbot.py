@@ -40,6 +40,9 @@ from telegraph.aio import Telegraph  # type: ignore
 from PIL import Image
 from pyzbar.pyzbar import decode  # pyright: ignore[reportUnknownVariableType, reportMissingTypeStubs]
 
+import db as botdb
+from i18n import t as _t, SUPPORTED_LANGUAGES
+
 # ── Environment ────────────────────────────────────────────────────────────────
 
 load_dotenv()
@@ -51,6 +54,9 @@ FLASK_SERVER_NAME = os.getenv('FLASK_SERVER_NAME', '127.0.0.1')
 
 os.makedirs("log", exist_ok=True)
 os.makedirs("data", exist_ok=True)
+
+# ── Database ───────────────────────────────────────────────────────────────────
+botdb.init_db()
 
 logging_file = os.path.join("log", f"{datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}.log")
 
@@ -66,6 +72,11 @@ logging.basicConfig(
 
 bot_logger = logging.getLogger("xhsfwbot")
 bot_logger.setLevel(logging.INFO)
+
+# ── Migrate legacy JSON → SQLite ───────────────────────────────────────────────
+_migrated = botdb.migrate_json_files('data')
+if _migrated:
+    bot_logger.info(f"Migrated {_migrated} JSON files to SQLite")
 
 # ── Concurrency ────────────────────────────────────────────────────────────────
 
@@ -123,14 +134,14 @@ class _ProgressControl:
 _progress_controls: dict[str, _ProgressControl] = {}
 
 
-def _progress_buttons(paused: bool = False, telegraph_url: str = '') -> list[list[Button]]:
+def _progress_buttons(paused: bool = False, telegraph_url: str = '', lang: str = 'en') -> list[list[Button]]:
     """Return inline keyboard for progress bar messages."""
     if paused:
-        rows: list[list[Button]] = [[Button.inline('▶️ Resume', b'prog_resume'),
-                                     Button.inline('❌ Cancel', b'prog_cancel')]]
+        rows: list[list[Button]] = [[Button.inline(_t('btn_resume', lang), b'prog_resume'),
+                                     Button.inline(_t('btn_cancel', lang), b'prog_cancel')]]
     else:
-        rows = [[Button.inline('⏸ Pause', b'prog_pause'),
-                 Button.inline('❌ Cancel', b'prog_cancel')]]
+        rows = [[Button.inline(_t('btn_pause', lang), b'prog_pause'),
+                 Button.inline(_t('btn_cancel', lang), b'prog_cancel')]]
     if telegraph_url:
         rows.append([Button.url('📝 Telegraph', telegraph_url)])
     return rows
@@ -168,6 +179,7 @@ def _action_buttons(data: dict[str, Any]) -> list[list[Button]] | None:
     primary_id = data.get('_primary_id', '')
     if not primary_id:
         return None
+    lang = data.get('lang', 'en')
     flags = data.get('flags', {})
     reactions_used = data.get('reactions_used', {})
     has_live = data.get('has_live_photos', False)
@@ -175,11 +187,11 @@ def _action_buttons(data: dict[str, Any]) -> list[list[Button]] | None:
 
     btns: list[Button] = []
     if not flags.get('send_as_file') and not reactions_used.get('file'):
-        btns.append(Button.inline('📁 Files', f'act_files:{primary_id}'.encode()))
+        btns.append(Button.inline(_t('btn_files', lang), f'act_files:{primary_id}'.encode()))
     if has_live and not flags.get('include_live_videos') and not reactions_used.get('eyes'):
-        btns.append(Button.inline('📸 Live Photos', f'act_live:{primary_id}'.encode()))
+        btns.append(Button.inline(_t('btn_live_photos', lang), f'act_live:{primary_id}'.encode()))
     if not reactions_used.get('thinking') and not media_too_large:
-        btns.append(Button.inline('🤖 AI Summary', f'act_ai:{primary_id}'.encode()))
+        btns.append(Button.inline(_t('btn_ai_summary', lang), f'act_ai:{primary_id}'.encode()))
     if not btns:
         return None
     return [btns]
@@ -279,14 +291,16 @@ def _format_eta(start_time: float, pct: float) -> str:
 def _progress_text(header: str, pct: float, detail: str = '',
                    start_time: float | None = None,
                    paused: bool = False,
-                   transferred_bytes: int = 0) -> str:
+                   transferred_bytes: int = 0,
+                   lang: str = 'en') -> str:
     """Build a multi-line progress message with bar, percentage, detail, speed and ETA."""
     bar = _make_progress_bar(pct)
     if paused:
-        parts = ['⏸ Paused']
+        _paused_str = _t('progress_paused', lang)
+        parts = [_paused_str]
         if detail:
             parts.append(detail)
-        return f'⏸ Paused\n{bar}\n{" · ".join(parts)}'
+        return f'{_paused_str}\n{bar}\n{" · ".join(parts)}'
     if pct <= 0:
         return f'{header}\n{bar}'
     parts = [f'{pct * 100:.0f}%']
@@ -316,6 +330,7 @@ def _build_summary_footer(
     media_too_large: bool = False,
     files_transfer_summary: str = '',
     live_transfer_summary: str = '',
+    lang: str = 'en',
 ) -> str:
     """Build a rich HTML footer for the progress/summary message."""
     if reactions_used is None:
@@ -325,51 +340,58 @@ def _build_summary_footer(
 
     # AI summary section (before flags)
     if ai_summary:
-        parts.append(f'\n<b>✨ AI Summary</b>\n<pre language="Note">{ai_summary}</pre>')
+        parts.append(f'\n<b>{_t("footer_ai_summary", lang)}</b>\n<pre language="Note">{ai_summary}</pre>')
 
     # ── Flags ──
-    flag_items: list[tuple[str, str, bool]] = []
+    flag_items: list[tuple[str, str, str]] = []
     if has_xsec_token:
-        flag_items.append(('-x', 'xsec_token', use_xsec))
-    flag_items.append(('-f', 'send as file', send_as_file))
+        flag_items.append(('-x', _t('flag_xsec_token', lang), 'use_xsec'))
+    flag_items.append(('-f', _t('flag_send_as_file', lang), 'send_as_file'))
     if has_live_photos:
-        flag_items.append(('-l', 'live photos', include_live_videos))
+        flag_items.append(('-l', _t('flag_live_photos', lang), 'live_photos'))
+    flag_values = {'use_xsec': use_xsec, 'send_as_file': send_as_file, 'live_photos': include_live_videos}
     flag_lines = []
     indent = '\u00A0\u00A0\u00A0'  # non-breaking spaces for Telegram indent
-    for flag, label, on in flag_items:
-        mark = '✅' if on else '◻️'
+    for flag, label, key in flag_items:
+        mark = '✅' if flag_values.get(key) else '◻️'
         flag_lines.append(f'{indent}{mark} <code>{flag}</code>\u2002<code>{label}</code>')
-    parts.append(f'\n<b>🏷 Flags</b>\n' + '\n'.join(flag_lines))
+    parts.append(f'\n<b>{_t("footer_flags", lang)}</b>\n' + '\n'.join(flag_lines))
 
     # ── Status lines ──
+    _files_label = _t('action_files', lang)
+    _live_label = _t('action_live_photos', lang)
+    _ai_label = _t('action_ai_summary', lang)
+    _anchor_label = _t('action_anchor_comment', lang)
+    _included = _t('action_included', lang)
+    _sending = _t('action_sending', lang)
     status_lines: list[str] = []
     if send_as_file:
-        status_lines.append(f'{indent}📁 Files — <i>included</i> <code>-f</code>')
+        status_lines.append(f'{indent}📁 {_files_label} — <i>{_included}</i> <code>-f</code>')
     elif reactions_used.get('file'):
         _f_icon = '🚫' if reactions_used['file'] == 'cancelled' else '✅'
-        _file_line = f'{indent}📁 <s>Files</s>\u2002{_f_icon}'
+        _file_line = f'{indent}📁 <s>{_files_label}</s>\u2002{_f_icon}'
         if files_transfer_summary:
             for _ts_line in files_transfer_summary.split('\n'):
                 _file_line += f'\n{indent}\u2002\u2002{_ts_line}'
         status_lines.append(_file_line)
     if has_live_photos and include_live_videos:
-        status_lines.append(f'{indent}📸 Live photos — <i>included</i> <code>-l</code>')
+        status_lines.append(f'{indent}📸 {_live_label} — <i>{_included}</i> <code>-l</code>')
     elif has_live_photos and reactions_used.get('eyes'):
         _l_icon = '🚫' if reactions_used['eyes'] == 'cancelled' else '✅'
-        _live_line = f'{indent}📸 <s>Live photos</s>\u2002{_l_icon}'
+        _live_line = f'{indent}📸 <s>{_live_label}</s>\u2002{_l_icon}'
         if live_transfer_summary:
             for _ts_line in live_transfer_summary.split('\n'):
                 _live_line += f'\n{indent}\u2002\u2002{_ts_line}'
         status_lines.append(_live_line)
     if reactions_used.get('thinking'):
-        status_lines.append(f'{indent}🤖 <s>AI Summary</s>\u2002✅')
+        status_lines.append(f'{indent}🤖 <s>{_ai_label}</s>\u2002✅')
     if has_anchor_comments:
         if anchor_comments_sent:
-            status_lines.append(f'{indent}💬 Anchor comment\u2002✅')
+            status_lines.append(f'{indent}💬 {_anchor_label}\u2002✅')
         else:
-            status_lines.append(f'{indent}💬 Anchor comment — <i>⏳ sending</i>')
+            status_lines.append(f'{indent}💬 {_anchor_label} — <i>{_sending}</i>')
     if status_lines:
-        parts.append(f'\n<b>⚡ Actions</b>\n' + '\n'.join(status_lines))
+        parts.append(f'\n<b>{_t("footer_actions", lang)}</b>\n' + '\n'.join(status_lines))
 
     return ''.join(parts)
 
@@ -413,6 +435,78 @@ def remove_image_url_params(url: str) -> str:
     return url
 
 
+# ── Media range parser (-r flag) ──────────────────────────────────────────────
+
+def parse_media_range(text: str) -> tuple[set[int], set[int]] | None:
+    """Parse -r flag from message text.
+
+    Returns (indices_set, live_indices_set) — 1-based photo indices.
+    ``live_indices_set`` contains indices whose corresponding live photo
+    should also be sent (marked with trailing ``l``).
+
+    Examples:
+        -r 1-3      → ({1,2,3}, set())
+        -r 3-5,7    → ({3,4,5,7}, set())
+        -r 2-4l     → ({2,3,4}, {2,3,4})
+        -r 1-3,5-6l → ({1,2,3,5,6}, {5,6})
+
+    Returns None if no -r flag found.
+    """
+    match = re.search(r'(?<!\S)-r\s+([\d\-,\sl]+?)(?=\s+-[a-z]|\s*$)', text)
+    if not match:
+        return None
+    raw = match.group(1).strip()
+    indices: set[int] = set()
+    live_indices: set[int] = set()
+
+    for part in re.split(r'[,\s]+', raw):
+        part = part.strip()
+        if not part:
+            continue
+        has_live = part.endswith('l')
+        if has_live:
+            part = part[:-1]
+        if '-' in part:
+            bounds = part.split('-', 1)
+            try:
+                lo, hi = int(bounds[0]), int(bounds[1])
+            except ValueError:
+                return None  # signal invalid
+            if lo > hi or lo < 1:
+                return None
+            rng = set(range(lo, hi + 1))
+        else:
+            try:
+                val = int(part)
+            except ValueError:
+                return None
+            if val < 1:
+                return None
+            rng = {val}
+        indices |= rng
+        if has_live:
+            live_indices |= rng
+
+    return (indices, live_indices) if indices else None
+
+
+def format_range_display(indices: set[int]) -> str:
+    """Format a set of integers into a compact range string like '1-3, 5, 7-9'."""
+    if not indices:
+        return ''
+    sorted_idx = sorted(indices)
+    ranges: list[str] = []
+    start = prev = sorted_idx[0]
+    for i in sorted_idx[1:]:
+        if i == prev + 1:
+            prev = i
+        else:
+            ranges.append(f'{start}-{prev}' if start != prev else str(start))
+            start = prev = i
+    ranges.append(f'{start}-{prev}' if start != prev else str(start))
+    return ', '.join(ranges)
+
+
 def open_note(noteId: str, anchorCommentId: str | None = None) -> dict[str, Any] | None:
     try:
         return requests.get(
@@ -428,6 +522,9 @@ def get_url_info(message_text: str) -> dict[str, str | bool]:
     urls = re.findall(URL_REGEX, message_text)
     bot_logger.info(f'URLs:\n{urls}')
     anchorCommentId = ''
+    # Count XHS-specific links (xhslink.com or xiaohongshu.com)
+    xhs_urls = [u for u in urls if 'xhslink.com' in u or 'xiaohongshu.com' in u]
+    had_multiple = len(xhs_urls) > 1
     if len(urls) == 0:
         bot_logger.debug("NO URL FOUND!")
         return {'success': False, 'msg': 'No URL found in the message.', 'noteId': '', 'xsec_token': '', 'anchorCommentId': ''}
@@ -479,7 +576,7 @@ def get_url_info(message_text: str) -> dict[str, str | bool]:
             return {'success': False, 'msg': 'Invalid URL or the note is no longer available.', 'noteId': '', 'xsec_token': ''}
     else:
         return {'success': False, 'msg': 'Invalid URL.', 'noteId': '', 'xsec_token': ''}
-    return {'success': True, 'msg': 'Success.', 'noteId': noteId, 'xsec_token': xsec_token, 'anchorCommentId': anchorCommentId}
+    return {'success': True, 'msg': 'Success.', 'noteId': noteId, 'xsec_token': xsec_token, 'anchorCommentId': anchorCommentId, 'had_multiple': had_multiple}
 
 
 def parse_comment(comment_data: dict[str, Any]):
@@ -893,6 +990,8 @@ class Note:
         _progress_ctrl: '_ProgressControl | None' = None,
         original_url: str = '',
         anchor_comment_id: str = '',
+        media_range: tuple[set[int], set[int]] | None = None,
+        lang: str = 'en',
     ) -> None:
         """Send this note to Telegram using the Telethon client."""
         sent_messages: list = []
@@ -906,6 +1005,42 @@ class Note:
         photo_urls = [img['url'] for img in self.images_list if not img['live']]
         live_photo_urls = [img['url'] for img in self.images_list if img['live']]
         live_photo_count = len(live_photo_urls)
+
+        # Apply media range filter (-r flag)
+        if media_range and photo_urls:
+            range_indices, live_range_indices = media_range
+            # Filter photos: keep only 1-based indices in range_indices
+            filtered_photo_urls: list[str] = []
+            filtered_live_urls: list[str] = []
+            # Build a map: photo index (1-based) → (photo_url, live_url or None)
+            photo_idx = 0
+            live_idx = 0
+            for img in self.images_list:
+                if img['live']:
+                    # This live URL belongs to the NEXT photo (which follows it)
+                    continue
+                photo_idx += 1
+                # Find if this photo has a preceding live entry
+                has_live = False
+                # Live photos precede their corresponding static photo in images_list
+                img_pos = self.images_list.index(img)
+                if img_pos > 0 and self.images_list[img_pos - 1].get('live'):
+                    has_live = True
+                    live_url = self.images_list[img_pos - 1]['url']
+                if photo_idx in range_indices:
+                    filtered_photo_urls.append(img['url'])
+                    if has_live and (include_live_videos or photo_idx in live_range_indices):
+                        filtered_live_urls.append(live_url)
+            photo_urls = filtered_photo_urls
+            # If -r specifies live indices, override include_live_videos for range selection
+            if live_range_indices:
+                live_photo_urls = filtered_live_urls
+                live_photo_count = len(filtered_live_urls)
+                if not include_live_videos:
+                    include_live_videos = bool(filtered_live_urls)
+            elif include_live_videos:
+                live_photo_urls = filtered_live_urls
+                live_photo_count = len(filtered_live_urls)
 
         # Handle video
         video_data: bytes | None = None
@@ -944,7 +1079,7 @@ class Note:
                 bot_logger.info(f"Video size: {size_mb:.2f}MB")
 
                 if show_progress:
-                    msg_text = _progress_text(f'📥 Downloading video ({size_mb:.1f} MB)...', 0)
+                    msg_text = _progress_text(_t('progress_downloading_video', lang, size_mb=f'{size_mb:.1f}'), 0)
                     _btns = _progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None
                     if progress_msg:
                         try:
@@ -978,8 +1113,8 @@ class Note:
                         dl_mb = downloaded / (1024 * 1024)
                         try:
                             await progress_msg.edit(
-                                _progress_text(f'📥 Downloading video ({size_mb:.1f} MB)...', pct, f'{dl_mb:.1f}/{size_mb:.1f} MB', dl_start_time, transferred_bytes=downloaded),
-                                buttons=_progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None,
+                                _progress_text(_t('progress_downloading_video', lang, size_mb=f'{size_mb:.1f}'), pct, f'{dl_mb:.1f}/{size_mb:.1f} MB', dl_start_time, transferred_bytes=downloaded),
+                                buttons=_progress_buttons(telegraph_url=_tg_url, lang=lang) if _progress_ctrl else None,
                             )
                         except MessageNotModifiedError:
                             pass
@@ -990,8 +1125,8 @@ class Note:
                 if progress_msg:
                     try:
                         await progress_msg.edit(
-                            f'📥 Video downloaded ({size_mb:.1f} MB, {dl_elapsed:.1f}s). Uploading...',
-                            buttons=_progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None,
+                            _t('progress_video_downloaded_uploading', lang, size_mb=f'{size_mb:.1f}', elapsed=f'{dl_elapsed:.1f}'),
+                            buttons=_progress_buttons(telegraph_url=_tg_url, lang=lang) if _progress_ctrl else None,
                         )
                     except MessageNotModifiedError:
                         pass
@@ -1010,8 +1145,8 @@ class Note:
                     if progress_msg:
                         try:
                             await progress_msg.edit(
-                                _progress_text(f'📤 Uploading file ({upload_mb:.1f} MB)...', 0),
-                                buttons=_progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None,
+                                _progress_text(_t('progress_uploading_file', lang, size_mb=f'{upload_mb:.1f}'), 0),
+                                buttons=_progress_buttons(telegraph_url=_tg_url, lang=lang) if _progress_ctrl else None,
                             )
                         except MessageNotModifiedError:
                             pass
@@ -1033,8 +1168,8 @@ class Note:
                         tot_mb = total / (1024 * 1024)
                         try:
                             await progress_msg.edit(
-                                _progress_text(f'📤 Uploading file ({tot_mb:.1f} MB)...', pct, f'{cur_mb:.1f}/{tot_mb:.1f} MB', ul_start_time, transferred_bytes=current),
-                                buttons=_progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None,
+                                _progress_text(_t('progress_uploading_file', lang, size_mb=f'{tot_mb:.1f}'), pct, f'{cur_mb:.1f}/{tot_mb:.1f} MB', ul_start_time, transferred_bytes=current),
+                                buttons=_progress_buttons(telegraph_url=_tg_url, lang=lang) if _progress_ctrl else None,
                             )
                         except MessageNotModifiedError:
                             pass
@@ -1053,11 +1188,11 @@ class Note:
                         try:
                             _dl_spd = _speed_str(dl_elapsed, len(video_data))
                             _ul_spd = _speed_str(ul_elapsed, len(video_data))
-                            summary = f'✅ Video file sent ({upload_mb:.1f} MB)\n'
-                            summary += f'📥 Download: {dl_elapsed:.1f}s'
+                            summary = _t('summary_video_file_sent', lang, size_mb=f'{upload_mb:.1f}') + '\n'
+                            summary += _t('summary_download_time', lang, elapsed=f'{dl_elapsed:.1f}')
                             if _dl_spd:
                                 summary += f' ({_dl_spd})'
-                            summary += f'\n📤 Upload: {ul_elapsed:.1f}s'
+                            summary += '\n' + _t('summary_upload_time', lang, elapsed=f'{ul_elapsed:.1f}')
                             if _ul_spd:
                                 summary += f' ({_ul_spd})'
                             await progress_msg.edit(summary, buttons=None)
@@ -1121,14 +1256,14 @@ class Note:
                     if progress_msg:
                         try:
                             await progress_msg.edit(
-                                _progress_text(f'📤 Uploading video ({upload_mb:.1f} MB)...', 0),
-                                buttons=_progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None,
+                                _progress_text(_t('progress_uploading_video', lang, size_mb=f'{upload_mb:.1f}'), 0),
+                                buttons=_progress_buttons(telegraph_url=_tg_url, lang=lang) if _progress_ctrl else None,
                             )
                         except MessageNotModifiedError:
                             pass
                     elif show_progress:
-                        msg_text = _progress_text(f'📤 Uploading video ({upload_mb:.1f} MB)...', 0)
-                        _btns = _progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None
+                        msg_text = _progress_text(_t('progress_uploading_video', lang, size_mb=f'{upload_mb:.1f}'), 0)
+                        _btns = _progress_buttons(telegraph_url=_tg_url, lang=lang) if _progress_ctrl else None
                         if progress_msg:
                             try:
                                 await progress_msg.edit(msg_text, buttons=_btns)
@@ -1158,8 +1293,8 @@ class Note:
                         tot_mb = total / (1024 * 1024)
                         try:
                             await progress_msg.edit(
-                                _progress_text(f'📤 Uploading video ({tot_mb:.1f} MB)...', pct, f'{cur_mb:.1f}/{tot_mb:.1f} MB', ul_start_time, transferred_bytes=current),
-                                buttons=_progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None,
+                                _progress_text(_t('progress_uploading_video', lang, size_mb=f'{tot_mb:.1f}'), pct, f'{cur_mb:.1f}/{tot_mb:.1f} MB', ul_start_time, transferred_bytes=current),
+                                buttons=_progress_buttons(telegraph_url=_tg_url, lang=lang) if _progress_ctrl else None,
                             )
                         except MessageNotModifiedError:
                             pass
@@ -1220,8 +1355,8 @@ class Note:
 
             async with bot.action(chat_id, 'document' if send_as_file else 'photo'):
                 if show_progress or total_download > 1:
-                    msg_text = _progress_text(f'📥 Downloading {total_download} file(s)...', 0)
-                    _btns = _progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None
+                    msg_text = _progress_text(_t('progress_downloading_n_files', lang, count=total_download), 0)
+                    _btns = _progress_buttons(telegraph_url=_tg_url, lang=lang) if _progress_ctrl else None
                     if progress_msg:
                         try:
                             await progress_msg.edit(msg_text, buttons=_btns)
@@ -1255,8 +1390,8 @@ class Note:
                         pct = (idx + 1) / total_download
                         try:
                             await progress_msg.edit(
-                                _progress_text('📥 Downloading files...', pct, f'{idx + 1}/{total_download}', dl_start_time, transferred_bytes=total_media_bytes),
-                                buttons=_progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None,
+                                _progress_text(_t('progress_downloading_files', lang), pct, f'{idx + 1}/{total_download}', dl_start_time, transferred_bytes=total_media_bytes),
+                                buttons=_progress_buttons(telegraph_url=_tg_url, lang=lang) if _progress_ctrl else None,
                             )
                         except MessageNotModifiedError:
                             pass
@@ -1265,8 +1400,8 @@ class Note:
                 if progress_msg:
                     try:
                         await progress_msg.edit(
-                            _progress_text(f'📤 Uploading {len(photo_urls)} photo(s)...', 0),
-                            buttons=_progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None,
+                            _progress_text(_t('progress_uploading_n_photos', lang, count=len(photo_urls)), 0),
+                            buttons=_progress_buttons(telegraph_url=_tg_url, lang=lang) if _progress_ctrl else None,
                         )
                     except MessageNotModifiedError:
                         pass
@@ -1303,8 +1438,8 @@ class Note:
                         cur_mb = overall / (1024 * 1024)
                         try:
                             await progress_msg.edit(
-                                _progress_text(f'📤 Uploading photos ({fi + 1}/{len(all_files)})...', pct, f'{cur_mb:.1f}/{total_size:.1f} MB', ul_start_time, transferred_bytes=overall),
-                                buttons=_progress_buttons(telegraph_url=_tg_url) if _progress_ctrl else None,
+                                _progress_text(_t('progress_uploading_photos_n', lang, current=fi + 1, total=len(all_files)), pct, f'{cur_mb:.1f}/{total_size:.1f} MB', ul_start_time, transferred_bytes=overall),
+                                buttons=_progress_buttons(telegraph_url=_tg_url, lang=lang) if _progress_ctrl else None,
                             )
                         except MessageNotModifiedError:
                             pass
@@ -1340,12 +1475,12 @@ class Note:
                         _dl_spd = _speed_str(dl_elapsed, total_media_bytes)
                         _ul_spd = _speed_str(ul_elapsed, total_bytes_photos)
                         lv_included = sum(1 for d in download_list if d['type'] == 'live_video')
-                        summary = f'✅ {len(download_list)} file(s) sent\n'
-                        summary += f'📦 Total size: {total_size:.1f} MB\n'
-                        summary += f'📥 Download: {dl_elapsed:.1f}s'
+                        summary = _t('summary_n_files_sent', lang, count=len(download_list)) + '\n'
+                        summary += _t('summary_total_size', lang, size_mb=f'{total_size:.1f}') + '\n'
+                        summary += _t('summary_download_time', lang, elapsed=f'{dl_elapsed:.1f}')
                         if _dl_spd:
                             summary += f' ({_dl_spd})'
-                        summary += f'\n📤 Upload: {ul_elapsed:.1f}s'
+                        summary += '\n' + _t('summary_upload_time', lang, elapsed=f'{ul_elapsed:.1f}')
                         if _ul_spd:
                             summary += f' ({_ul_spd})'
                         await progress_msg.edit(summary, buttons=None)
@@ -1392,6 +1527,7 @@ class Note:
                 'anchorCommentId': anchor_comment_id,
                 'original_url': original_url,
                 'progress_msg_id': progress_msg.id if progress_msg else None,
+                'lang': lang,
                 'reactions_used': {'file': False, 'eyes': False, 'thinking': False},
                 'ai_summary': '',
                 'flags': {'send_as_file': send_as_file, 'include_live_videos': include_live_videos, 'use_xsec': use_xsec},
@@ -1401,10 +1537,8 @@ class Note:
                 'has_anchor_comments': bool(self.comments_with_context),
                 'anchor_comments_sent': False,
             }
-            primary_path = os.path.join('data', f'{msg_identifier}.json')
-            with open(primary_path, 'w', encoding='utf-8') as f:
-                json.dump(msg_data, f, indent=4, ensure_ascii=False)
-            bot_logger.debug(f"Saved message data to data/{msg_identifier}.json")
+            botdb.save_message_state(msg_identifier, chat_id, msg_data)
+            bot_logger.debug(f"Saved message data to DB")
 
             # Create alias files so reactions on any media-group message
             # or the summary message resolve to the primary data file.
@@ -1414,12 +1548,8 @@ class Note:
             if progress_msg:
                 alias_ids.add(progress_msg.id)
             for aid in alias_ids:
-                alias_path = os.path.join('data', f'{chat_id}.{aid}.json')
-                try:
-                    with open(alias_path, 'w', encoding='utf-8') as f:
-                        json.dump({'ref': msg_identifier}, f)
-                except Exception:
-                    pass
+                alias_key = f'{chat_id}.{aid}'
+                botdb.save_message_alias(alias_key, msg_identifier)
             bot_logger.debug(f"Created {len(alias_ids)} alias file(s) for {msg_identifier}")
         except Exception as e:
             bot_logger.error(f"Failed to save message data: {e}")
@@ -1432,7 +1562,7 @@ class Note:
             comment_media_sent = 0
             cm_start_time = time.monotonic()
             if comment_with_media_count > 0:
-                msg_text = _progress_text(f'💬 Sending comment media (0/{comment_with_media_count})...', 0)
+                msg_text = _progress_text(_t('progress_sending_comment_media', lang), 0)
                 if progress_msg:
                     try:
                         await progress_msg.edit(msg_text)
@@ -1586,7 +1716,7 @@ class Note:
                         pct = comment_media_sent / comment_with_media_count
                         try:
                             await progress_msg.edit(
-                                _progress_text('💬 Sending comment media...', pct, f'{comment_media_sent}/{comment_with_media_count}', cm_start_time)
+                                _progress_text(_t('progress_sending_comment_media', lang), pct, f'{comment_media_sent}/{comment_with_media_count}', cm_start_time)
                             )
                         except MessageNotModifiedError:
                             pass
@@ -1606,12 +1736,11 @@ class Note:
         anchor_comments_sent = bool(self.comments_with_context)
         if anchor_comments_sent:
             try:
-                fp = os.path.join('data', f'{msg_identifier}.json')
-                with open(fp, 'r', encoding='utf-8') as f:
-                    saved = json.load(f)
-                saved['anchor_comments_sent'] = True
-                with open(fp, 'w', encoding='utf-8') as f:
-                    json.dump(saved, f, indent=4, ensure_ascii=False)
+                _db_res = botdb.load_message_state(msg_identifier)
+                if _db_res:
+                    _saved_ac, _pid_ac = _db_res
+                    _saved_ac['anchor_comments_sent'] = True
+                    botdb.update_message_state(_pid_ac, _saved_ac)
             except Exception as e:
                 bot_logger.debug(f"Failed to update anchor_comments_sent: {e}")
 
@@ -1621,13 +1750,13 @@ class Note:
                 # Read the current progress message text as base
                 current = (await bot.get_messages(chat_id, ids=progress_msg.id)).message or ''
                 # Save base text for later reconstruction by action handlers
+                saved: dict[str, Any] = {}
                 try:
-                    fp = os.path.join('data', f'{msg_identifier}.json')
-                    with open(fp, 'r', encoding='utf-8') as f:
-                        saved = json.load(f)
-                    saved['summary_base_text'] = current
-                    with open(fp, 'w', encoding='utf-8') as f:
-                        json.dump(saved, f, indent=4, ensure_ascii=False)
+                    _db_res2 = botdb.load_message_state(msg_identifier)
+                    if _db_res2:
+                        saved, _pid2 = _db_res2
+                        saved['summary_base_text'] = current
+                        botdb.update_message_state(_pid2, saved)
                 except Exception:
                     pass
                 footer = _build_summary_footer(
@@ -1641,14 +1770,9 @@ class Note:
                     media_too_large=total_media_bytes > AI_SUMMARY_MAX_MEDIA_BYTES,
                     files_transfer_summary=saved.get('files_transfer_summary', ''),
                     live_transfer_summary=saved.get('live_transfer_summary', ''),
+                    lang=lang,
                 )
-                # Build action buttons from saved data
-                try:
-                    with open(os.path.join('data', f'{msg_identifier}.json'), 'r', encoding='utf-8') as f:
-                        saved_data = json.load(f)
-                    btns = _action_buttons(saved_data)
-                except Exception:
-                    btns = None
+                btns = _action_buttons(saved) if saved else None
                 await progress_msg.edit(current + footer, parse_mode='html', buttons=btns)
             except MessageNotModifiedError:
                 pass
@@ -1766,7 +1890,6 @@ async def _run_ai_summary(
     gemini_client: genai.Client,
     chat_id: int,
     message_id: int,
-    msg_file_path: str,
     data: dict[str, Any],
 ) -> None:
     """Generate AI summary and edit it into the progress/summary message."""
@@ -1778,15 +1901,15 @@ async def _run_ai_summary(
     flags = data.get('flags', {})
     has_live = data.get('has_live_photos', False)
     reactions_used = data.get('reactions_used', {})
+    lang = data.get('lang', 'en')
 
     async def _update_with_ai(ai_text: str) -> None:
         """Edit the progress/summary message with AI summary in the footer."""
         data['ai_summary'] = ai_text
         try:
-            with open(msg_file_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
+            botdb.update_message_state(data.get('_primary_id', ''), data)
         except Exception as e:
-            bot_logger.debug(f"Failed to save ai_summary to JSON: {e}")
+            bot_logger.debug(f"Failed to save ai_summary: {e}")
         try:
             base_text = data.get('summary_base_text', '')
             if not base_text:
@@ -1799,7 +1922,7 @@ async def _run_ai_summary(
                 if idx != -1:
                     text = text[:idx]
                 else:
-                    marker = '\n🏷 Flags'
+                    marker = '\n' + _t('footer_flags', lang)
                     idx = text.find(marker)
                     if idx != -1:
                         text = text[:idx]
@@ -1817,6 +1940,7 @@ async def _run_ai_summary(
                 media_too_large=data.get('total_media_bytes', 0) > AI_SUMMARY_MAX_MEDIA_BYTES,
                 files_transfer_summary=data.get('files_transfer_summary', ''),
                 live_transfer_summary=data.get('live_transfer_summary', ''),
+                lang=lang,
             )
             btns = _action_buttons(data)
             await asyncio.sleep(0.25)
@@ -1950,17 +2074,26 @@ def run_telegram_bot() -> None:
 
     # ── /start ─────────────────────────────────────────────────────────────────
 
-    @bot.on(events.NewMessage(pattern=r'^/start(\s|$)'))
+    @bot.on(events.NewMessage(pattern=r'^/start(@\w+)?(\s|$)'))
     async def start_handler(event: events.NewMessage.Event) -> None:
         try:
-            await event.respond("I'm xhsfwbot, please send me a xhs link!\n/help for more info.")
+            user_id = event.sender_id
+            sender = await event.get_sender()
+            botdb.upsert_user(
+                user_id,
+                tg_username=getattr(sender, 'username', '') or '',
+                tg_first_name=getattr(sender, 'first_name', '') or '',
+                tg_last_name=getattr(sender, 'last_name', '') or '',
+            )
+            lang = botdb.get_user_lang(user_id)
+            await event.respond(_t('start_greeting', lang), parse_mode='html')
         except Exception as e:
             bot_logger.error(f"Failed to send start message: {e}")
         raise events.StopPropagation
 
     # ── /help ──────────────────────────────────────────────────────────────────
 
-    @bot.on(events.NewMessage(pattern=r'^/help(\s|$)'))
+    @bot.on(events.NewMessage(pattern=r'^/help(@\w+)?(\s|$)'))
     async def help_handler(event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
         bot_logger.debug(f"Help requested by user {user_id}")
@@ -1997,7 +2130,7 @@ def run_telegram_bot() -> None:
 
     # ── /sethelp ───────────────────────────────────────────────────────────────
 
-    @bot.on(events.NewMessage(pattern=r'^/sethelp(\s|$)'))
+    @bot.on(events.NewMessage(pattern=r'^/sethelp(@\w+)?(\s|$)'))
     async def sethelp_handler(event: events.NewMessage.Event) -> None:
         global help_config
         if not admin_id or event.sender_id != admin_id:
@@ -2035,7 +2168,7 @@ def run_telegram_bot() -> None:
 
     # ── /clearhelp ─────────────────────────────────────────────────────────────
 
-    @bot.on(events.NewMessage(pattern=r'^/clearhelp(\s|$)'))
+    @bot.on(events.NewMessage(pattern=r'^/clearhelp(@\w+)?(\s|$)'))
     async def clearhelp_handler(event: events.NewMessage.Event) -> None:
         global help_config
         if not admin_id or event.sender_id != admin_id:
@@ -2049,59 +2182,166 @@ def run_telegram_bot() -> None:
         )
         raise events.StopPropagation
 
+    # ── /settings ──────────────────────────────────────────────────────────────
+
+    # Telegram's anonymous admin bot ID (Bot API only; in MTProto sender_id is None)
+    _ANONYMOUS_ADMIN_ID = 1087968824
+
+    def _is_anonymous_sender(chat_id: int | None, user_id: int | None) -> bool:
+        """Return True if the sender is an anonymous admin.
+
+        In Telethon (MTProto), anonymous admin messages have sender_id = None
+        and from_id = None.  In the HTTP Bot API, they come from
+        GroupAnonymousBot (1087968824).  We check all cases."""
+        result = (
+            user_id is None  # MTProto: anonymous admin → sender_id is None
+            or user_id == _ANONYMOUS_ADMIN_ID  # Bot API: GroupAnonymousBot
+        )
+        bot_logger.debug(
+            f"[AnonCheck] _is_anonymous_sender: chat_id={chat_id}, user_id={user_id}, "
+            f"is_None={user_id is None}, "
+            f"matches_ANON_ID={user_id == _ANONYMOUS_ADMIN_ID}, result={result}"
+        )
+        return result
+
+    async def _is_chat_admin(chat_id: int, user_id: int | None) -> bool:
+        """Return True if user is an admin or creator in the given chat,
+        or if the sender is an anonymous admin (posting as the group).
+
+        IMPORTANT: The bot must itself be an admin in the group to see
+        anonymous admins' real user IDs in the admin list.  When an anonymous
+        admin clicks an inline button, Telegram reveals their real user ID;
+        ``get_permissions`` will only recognize them as admin if the bot has
+        admin privileges.
+        """
+        if _is_anonymous_sender(chat_id, user_id):
+            bot_logger.debug(f"[AnonCheck] _is_chat_admin: anonymous sender → True")
+            return True
+        if user_id is None:
+            bot_logger.debug(f"[AnonCheck] _is_chat_admin: user_id is None → False")
+            return False
+        try:
+            perms = await bot.get_permissions(chat_id, user_id)
+            # Telethon may return ChatBannedRights (no is_admin attr) for
+            # non-participants or when the bot lacks admin rights.
+            is_adm = bool(getattr(perms, 'is_admin', False) or getattr(perms, 'is_creator', False))
+            bot_logger.debug(
+                f"[AnonCheck] _is_chat_admin: chat_id={chat_id}, user_id={user_id}, "
+                f"is_admin={getattr(perms, 'is_admin', '?')}, "
+                f"is_creator={getattr(perms, 'is_creator', '?')}, "
+                f"result={is_adm}, perms_type={type(perms).__name__}"
+            )
+            return is_adm
+        except Exception as e:
+            bot_logger.warning(
+                f"[AnonCheck] _is_chat_admin FAILED: chat_id={chat_id}, user_id={user_id}, "
+                f"error={type(e).__name__}: {e}"
+            )
+            return False
+
+    @bot.on(events.NewMessage(pattern=r'^/settings(@\w+)?(\s|$)'))
+    async def settings_handler(event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        chat_id = event.chat_id
+        is_group = not event.is_private
+        # Log raw event details for anonymous admin debugging
+        _msg = event.message
+        bot_logger.info(
+            f"[Settings] /settings received: user_id={user_id}, chat_id={chat_id}, "
+            f"is_private={event.is_private}, is_group={is_group}, "
+            f"from_id={getattr(_msg, 'from_id', None)}, "
+            f"peer_id={getattr(_msg, 'peer_id', None)}, "
+            f"sender_chat_type={type(getattr(_msg, 'from_id', None)).__name__}"
+        )
+        is_anon = is_group and _is_anonymous_sender(chat_id, user_id)
+        bot_logger.info(f"[Settings] is_anon={is_anon}")
+        # Ensure user exists in DB (skip for anonymous admin)
+        if not is_anon:
+            sender = await event.get_sender()
+            if sender and user_id:
+                botdb.upsert_user(
+                    user_id,
+                    tg_username=getattr(sender, 'username', '') or '',
+                    tg_first_name=getattr(sender, 'first_name', '') or '',
+                    tg_last_name=getattr(sender, 'last_name', '') or '',
+                )
+        user_lang = botdb.get_group_lang(chat_id) if is_anon else botdb.get_user_lang(user_id or 0)
+        if is_group:
+            if not await _is_chat_admin(chat_id, user_id):
+                await event.respond(_t('settings_group_admin_only', user_lang))
+                raise events.StopPropagation
+            botdb.upsert_group(chat_id)
+            text, buttons = _group_settings_text_and_buttons(chat_id, user_lang)
+        else:
+            text, buttons = _settings_text_and_buttons(user_id)
+        await event.respond(text, buttons=buttons, parse_mode='html')
+        raise events.StopPropagation
+
+    # ── /report ────────────────────────────────────────────────────────────────
+
+    @bot.on(events.NewMessage(pattern=r'^/report(\s|$)'))
+    async def report_handler(event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        lang = botdb.get_user_lang(user_id)
+        if not admin_id or user_id != admin_id:
+            raise events.StopPropagation
+
+        raw = event.message.message.strip()
+        parts = raw.split(maxsplit=1)
+        if len(parts) < 2:
+            await event.respond(_t('report_usage', lang))
+            raise events.StopPropagation
+
+        arg = parts[1].strip()
+        gen_msg = await event.respond(_t('report_generating', lang))
+
+        import io
+        csv_content: str | None = None
+        filename = 'report.csv'
+
+        # Date range: YYYYMMDD-YYYYMMDD
+        if '-' in arg and len(arg) == 17:
+            try:
+                start_str, end_str = arg.split('-', 1)
+                start_date = f'{start_str[:4]}-{start_str[4:6]}-{start_str[6:8]}'
+                end_date = f'{end_str[:4]}-{end_str[4:6]}-{end_str[6:8]}'
+                csv_content = botdb.generate_report_csv_range(start_date, end_date)
+                filename = f'report_{start_str}_{end_str}.csv'
+            except Exception:
+                pass
+        # Single date: YYYYMMDD
+        elif len(arg) == 8 and arg.isdigit():
+            date_str = f'{arg[:4]}-{arg[4:6]}-{arg[6:8]}'
+            csv_content = botdb.generate_report_csv(date_str)
+            filename = f'report_{arg}.csv'
+        # User ID
+        elif arg.isdigit():
+            csv_content = botdb.generate_report_csv_user(int(arg))
+            filename = f'report_user_{arg}.csv'
+        else:
+            if gen_msg:
+                await gen_msg.delete()
+            await event.respond(_t('report_usage', lang))
+            raise events.StopPropagation
+
+        if not csv_content or csv_content.count('\n') <= 1:
+            if gen_msg:
+                await gen_msg.delete()
+            await event.respond(_t('report_no_data', lang))
+            raise events.StopPropagation
+
+        buf = io.BytesIO(csv_content.encode('utf-8-sig'))
+        buf.name = filename
+        await bot.send_file(event.chat_id, buf, caption=f'📊 {filename}')
+        if gen_msg:
+            await gen_msg.delete()
+        raise events.StopPropagation
+
     async def _update_summary_msg(
         bot_client: TelegramClient, chat_id: int,
-        data: dict[str, Any], msg_file_path: str,
+        data: dict[str, Any], msg_file_path: str,  # msg_file_path kept for API compat
     ) -> None:
-        """Update the progress/summary message footer to reflect current action status."""
-        progress_msg_id = data.get('progress_msg_id')
-        if not progress_msg_id:
-            return
-        flags = data.get('flags', {})
-        reactions_used = data.get('reactions_used', {})
-        has_live = data.get('has_live_photos', False)
-        ai_summary = data.get('ai_summary', '')
-        base_text = data.get('summary_base_text', '')
-        try:
-            if not base_text:
-                msg = await bot_client.get_messages(chat_id, ids=progress_msg_id)
-                if not msg or not msg.message:
-                    return
-                text = msg.message
-                # Strip old footer
-                ai_marker = '\n✨ AI Summary'
-                idx = text.find(ai_marker)
-                if idx != -1:
-                    text = text[:idx]
-                else:
-                    marker = '\n🏷 Flags'
-                    idx = text.find(marker)
-                    if idx != -1:
-                        text = text[:idx]
-                base_text = text
-            footer = _build_summary_footer(
-                send_as_file=flags.get('send_as_file', False),
-                include_live_videos=flags.get('include_live_videos', False),
-                use_xsec=flags.get('use_xsec', False),
-                has_live_photos=has_live,
-                reactions_used=reactions_used,
-                ai_summary=ai_summary,
-                has_anchor_comments=data.get('has_anchor_comments', False),
-                anchor_comments_sent=data.get('anchor_comments_sent', False),
-                has_xsec_token=data.get('has_xsec_token', False),
-                media_too_large=data.get('total_media_bytes', 0) > AI_SUMMARY_MAX_MEDIA_BYTES,
-                files_transfer_summary=data.get('files_transfer_summary', ''),
-                live_transfer_summary=data.get('live_transfer_summary', ''),
-            )
-            btns = _action_buttons(data)
-            await bot_client.edit_message(
-                chat_id, progress_msg_id,
-                base_text + footer, parse_mode='html', buttons=btns,
-            )
-        except MessageNotModifiedError:
-            pass
-        except Exception as e:
-            bot_logger.debug(f"Failed to update summary footer: {e}")
+        pass  # superseded by _restore_summary
 
     # ── Callback query handler (replaces reaction-based control) ─────────────
 
@@ -2119,6 +2359,7 @@ def run_telegram_bot() -> None:
         reactions_used = data.get('reactions_used', {})
         has_live = data.get('has_live_photos', False)
         ai_summary = data.get('ai_summary', '')
+        lang = data.get('lang', 'en')
         footer = _build_summary_footer(
             send_as_file=flags.get('send_as_file', False),
             include_live_videos=flags.get('include_live_videos', False),
@@ -2132,6 +2373,7 @@ def run_telegram_bot() -> None:
             media_too_large=data.get('total_media_bytes', 0) > AI_SUMMARY_MAX_MEDIA_BYTES,
             files_transfer_summary=data.get('files_transfer_summary', ''),
             live_transfer_summary=data.get('live_transfer_summary', ''),
+            lang=lang,
         )
         btns = _action_buttons(data)
         try:
@@ -2143,6 +2385,205 @@ def run_telegram_bot() -> None:
             pass
         except Exception as e:
             bot_logger.debug(f"Failed to restore summary: {e}")
+
+    # ── Settings helpers ─────────────────────────────────────────────────────
+
+    def _settings_text_and_buttons(user_id: int) -> tuple[str, list[list[Button]]]:
+        """Build settings message text and inline keyboard for a user."""
+        prefs = botdb.get_user_prefs(user_id)
+        lang = prefs['language']
+        on = _t('settings_on', lang)
+        off = _t('settings_off', lang)
+
+        text_parts = [_t('settings_title', lang)]
+        text_parts.append(f"{_t('settings_language', lang)}：{SUPPORTED_LANGUAGES.get(lang, lang)}")
+        text_parts.append(f"{_t('settings_send_as_file', lang)}：{on if prefs['send_as_file'] else off}")
+        text_parts.append(f"{_t('settings_include_live', lang)}：{on if prefs['include_live'] else off}")
+        text_parts.append(f"{_t('settings_use_xsec', lang)}：{on if prefs['use_xsec'] else off}")
+        text_parts.append(f"{_t('settings_delete_original', lang)}：{on if not prefs['keep_original'] else off}")
+
+        file_label = f"📁 {'✅' if prefs['send_as_file'] else '❌'}"
+        live_label = f"📸 {'✅' if prefs['include_live'] else '❌'}"
+        xsec_label = f"🔐 {'✅' if prefs['use_xsec'] else '❌'}"
+        del_label = f"🗑 {'✅' if not prefs['keep_original'] else '❌'}"
+
+        buttons: list[list[Button]] = [
+            [
+                Button.inline(file_label, b'set_toggle:pref_send_as_file'),
+                Button.inline(live_label, b'set_toggle:pref_include_live'),
+                Button.inline(xsec_label, b'set_toggle:pref_use_xsec'),
+            ],
+            [Button.inline(del_label, b'set_toggle:pref_keep_original')],
+            [Button.inline(f"🌐 {SUPPORTED_LANGUAGES.get(lang, lang)}", b'set_lang_menu')],
+        ]
+        return '\n'.join(text_parts), buttons
+
+    def _group_settings_text_and_buttons(group_id: int, lang: str) -> tuple[str, list[list[Button]]]:
+        """Build group settings message text and inline keyboard for group admins."""
+        prefs = botdb.get_group_prefs(group_id)
+        on = _t('settings_on', lang)
+        off = _t('settings_off', lang)
+        glang = prefs['language']
+
+        text_parts = [_t('settings_group_title', lang)]
+        text_parts.append(f"{_t('settings_language', lang)}：{SUPPORTED_LANGUAGES.get(glang, glang)}")
+        text_parts.append(f"{_t('settings_send_as_file', lang)}：{on if prefs['send_as_file'] else off}")
+        text_parts.append(f"{_t('settings_include_live', lang)}：{on if prefs['include_live'] else off}")
+        text_parts.append(f"{_t('settings_use_xsec', lang)}：{on if prefs['use_xsec'] else off}")
+        text_parts.append(f"{_t('settings_delete_original', lang)}：{on if not prefs['keep_original'] else off}")
+
+        file_label = f"📁 {'✅' if prefs['send_as_file'] else '❌'}"
+        live_label = f"📸 {'✅' if prefs['include_live'] else '❌'}"
+        xsec_label = f"🔐 {'✅' if prefs['use_xsec'] else '❌'}"
+        del_label = f"🗑 {'✅' if not prefs['keep_original'] else '❌'}"
+
+        buttons: list[list[Button]] = [
+            [
+                Button.inline(file_label, b'set_grp_toggle:pref_send_as_file'),
+                Button.inline(live_label, b'set_grp_toggle:pref_include_live'),
+                Button.inline(xsec_label, b'set_grp_toggle:pref_use_xsec'),
+            ],
+            [Button.inline(del_label, b'set_grp_toggle:pref_keep_original')],
+            [Button.inline(f"🌐 {SUPPORTED_LANGUAGES.get(glang, glang)}", b'set_grp_lang_menu')],
+        ]
+        return '\n'.join(text_parts), buttons
+
+    async def _handle_settings_callback(event: events.CallbackQuery.Event, data_str: str) -> None:
+        """Handle all set_* callback queries for user/group settings.
+
+        NOTE on anonymous admins: When an admin sends a *message* as the group,
+        sender_id is the chat_id (or 1087968824 in Bot API).  But when that
+        same admin clicks an *inline button*, Telegram reveals their real
+        user ID.  Therefore ``_is_anonymous_sender`` will be False for callbacks.
+        We rely on ``_is_chat_admin`` (which requires the bot to be an admin)
+        to verify the real user is indeed a group admin.  For group callbacks
+        we always use the *group* language, not the user's personal language.
+        """
+        user_id = event.sender_id
+        is_group_cb = data_str.startswith('set_grp_')
+        bot_logger.info(
+            f"[SettingsCB] callback: data={data_str}, user_id={user_id}, "
+            f"chat_id={event.chat_id}, is_group_cb={is_group_cb}"
+        )
+
+        # For group callbacks, always use the group's language setting
+        if is_group_cb:
+            lang = botdb.get_group_lang(event.chat_id)
+        elif _is_anonymous_sender(event.chat_id, user_id):
+            lang = botdb.get_group_lang(event.chat_id)
+        else:
+            lang = botdb.get_user_lang(user_id)
+
+        # ── Group admin gate ──────────────────────────────────────────────
+        if is_group_cb:
+            is_admin = await _is_chat_admin(event.chat_id, user_id)
+            bot_logger.info(
+                f"[SettingsCB] group admin check: user_id={user_id}, "
+                f"chat_id={event.chat_id}, is_admin={is_admin}"
+            )
+            if not is_admin:
+                await event.answer(_t('settings_group_admin_only', lang), alert=True)
+                return
+
+        if data_str == 'set_lang_menu':
+            # Show language selection buttons, 2 per row
+            items = list(SUPPORTED_LANGUAGES.items())
+            rows: list[list[Button]] = []
+            for i in range(0, len(items), 2):
+                row = []
+                for code, display in items[i:i + 2]:
+                    check = ' ✓' if code == lang else ''
+                    row.append(Button.inline(f"{display}{check}", f'set_lang:{code}'.encode()))
+                rows.append(row)
+            rows.append([Button.inline('⬅️', b'set_back')])
+            await event.edit(_t('settings_select_language', lang), buttons=rows, parse_mode='html')
+            await event.answer()
+            return
+
+        if data_str.startswith('set_lang:'):
+            new_lang = data_str.split(':', 1)[1]
+            if new_lang in SUPPORTED_LANGUAGES:
+                botdb.set_user_pref(user_id, 'language', new_lang)
+                lang = new_lang
+            text, buttons = _settings_text_and_buttons(user_id)
+            await event.edit(text, buttons=buttons, parse_mode='html')
+            await event.answer(_t('settings_saved', lang))
+            return
+
+        if data_str.startswith('set_toggle:'):
+            pref_key = data_str.split(':', 1)[1]
+            prefs = botdb.get_user_prefs(user_id)
+            key_map = {
+                'pref_send_as_file': 'send_as_file',
+                'pref_include_live': 'include_live',
+                'pref_use_xsec': 'use_xsec',
+                'pref_keep_original': 'keep_original',
+            }
+            friendly = key_map.get(pref_key)
+            if friendly:
+                new_val = 0 if prefs[friendly] else 1
+                botdb.set_user_pref(user_id, pref_key, new_val)
+            text, buttons = _settings_text_and_buttons(user_id)
+            await event.edit(text, buttons=buttons, parse_mode='html')
+            await event.answer(_t('settings_saved', lang))
+            return
+
+        if data_str == 'set_back':
+            text, buttons = _settings_text_and_buttons(user_id)
+            await event.edit(text, buttons=buttons, parse_mode='html')
+            await event.answer()
+            return
+
+        # ── Group settings ────────────────────────────────────────────────
+        if data_str == 'set_grp_lang_menu':
+            items = list(SUPPORTED_LANGUAGES.items())
+            rows: list[list[Button]] = []
+            cur_glang = botdb.get_group_lang(event.chat_id)
+            for i in range(0, len(items), 2):
+                row = []
+                for code, display in items[i:i + 2]:
+                    check = ' ✓' if code == cur_glang else ''
+                    row.append(Button.inline(f"{display}{check}", f'set_grp_lang:{code}'.encode()))
+                rows.append(row)
+            rows.append([Button.inline('⬅️', b'set_grp_back')])
+            await event.edit(_t('settings_select_language', lang), buttons=rows, parse_mode='html')
+            await event.answer()
+            return
+
+        if data_str.startswith('set_grp_lang:'):
+            new_lang = data_str.split(':', 1)[1]
+            if new_lang in SUPPORTED_LANGUAGES:
+                botdb.set_group_pref(event.chat_id, 'language', new_lang)
+            text, buttons = _group_settings_text_and_buttons(event.chat_id, lang)
+            await event.edit(text, buttons=buttons, parse_mode='html')
+            await event.answer(_t('settings_saved', lang))
+            return
+
+        if data_str.startswith('set_grp_toggle:'):
+            pref_key = data_str.split(':', 1)[1]
+            grp_prefs = botdb.get_group_prefs(event.chat_id)
+            grp_key_map = {
+                'pref_send_as_file': 'send_as_file',
+                'pref_include_live': 'include_live',
+                'pref_use_xsec': 'use_xsec',
+                'pref_keep_original': 'keep_original',
+            }
+            friendly = grp_key_map.get(pref_key)
+            if friendly:
+                new_val = 0 if grp_prefs[friendly] else 1
+                botdb.set_group_pref(event.chat_id, pref_key, new_val)
+            text, buttons = _group_settings_text_and_buttons(event.chat_id, lang)
+            await event.edit(text, buttons=buttons, parse_mode='html')
+            await event.answer(_t('settings_saved', lang))
+            return
+
+        if data_str == 'set_grp_back':
+            text, buttons = _group_settings_text_and_buttons(event.chat_id, lang)
+            await event.edit(text, buttons=buttons, parse_mode='html')
+            await event.answer()
+            return
+
+        await event.answer('⚠️')
 
     @bot.on(events.CallbackQuery())
     async def callback_handler(event: events.CallbackQuery.Event) -> None:
@@ -2160,6 +2601,7 @@ def run_telegram_bot() -> None:
             if data_str == 'prog_pause':
                 ctrl.pause()
                 await event.answer('⏸ Paused')
+                _pause_lang = botdb.get_user_lang(event.sender_id or 0)
                 try:
                     msg = await bot.get_messages(chat_id, ids=msg_id)
                     if msg and msg.message:
@@ -2172,8 +2614,8 @@ def run_telegram_bot() -> None:
                                 pct_val = filled / total_w if total_w else 0
                                 break
                         await msg.edit(
-                            _progress_text('', pct_val, paused=True),
-                            buttons=_progress_buttons(paused=True),
+                            _progress_text('', pct_val, paused=True, lang=_pause_lang),
+                            buttons=_progress_buttons(paused=True, lang=_pause_lang),
                         )
                 except Exception:
                     pass
@@ -2186,25 +2628,31 @@ def run_telegram_bot() -> None:
             return
 
         # ── Action callbacks ──────────────────────────────────────────────
-        if not data_str.startswith('act_'):
+        if not data_str.startswith('act_') and not data_str.startswith('set_'):
             return
+
+        # ─ Settings callbacks ─────────────────────────────────────────────
+        if data_str.startswith('set_'):
+            await _handle_settings_callback(event, data_str)
+            return
+
         parts = data_str.split(':', 1)
         if len(parts) != 2:
             await event.answer('⚠️ Invalid action')
             return
         action_type, primary_id = parts[0], parts[1]
 
+        # Try DB first, then fall back to JSON file
         msg_file_path = os.path.join('data', f'{primary_id}.json')
-        if not os.path.exists(msg_file_path):
+        db_result = botdb.load_message_state(primary_id)
+        if db_result:
+            note_data, _ = db_result
+        elif os.path.exists(msg_file_path):
+            with open(msg_file_path, 'r', encoding='utf-8') as f:
+                note_data = json.load(f)
+        else:
             await event.answer('⚠️ Data not found')
             return
-
-        if primary_id in _action_busy:
-            await event.answer('⚠️ Another action in progress')
-            return
-
-        with open(msg_file_path, 'r', encoding='utf-8') as f:
-            note_data = json.load(f)
 
         reaction_key = {'act_files': 'file', 'act_live': 'eyes', 'act_ai': 'thinking'}.get(action_type)
         if not reaction_key:
@@ -2213,8 +2661,7 @@ def run_telegram_bot() -> None:
 
         # Mark action as used IMMEDIATELY (button won't come back even if aborted)
         note_data.setdefault('reactions_used', {})[reaction_key] = True
-        with open(msg_file_path, 'w', encoding='utf-8') as f:
-            json.dump(note_data, f, indent=4, ensure_ascii=False)
+        botdb.update_message_state(primary_id, note_data)
 
         # Update buttons immediately (remove the clicked action)
         btns = _action_buttons(note_data)
@@ -2232,11 +2679,11 @@ def run_telegram_bot() -> None:
         _action_busy.add(primary_id)
         try:
             if action_type == 'act_files':
-                await _handle_files_action(chat_id, msg_id, note_data, msg_file_path)
+                await _handle_files_action(chat_id, msg_id, note_data)
             elif action_type == 'act_live':
-                await _handle_live_action(chat_id, msg_id, note_data, msg_file_path)
+                await _handle_live_action(chat_id, msg_id, note_data)
             elif action_type == 'act_ai':
-                await _handle_ai_action(chat_id, msg_id, note_data, msg_file_path)
+                await _handle_ai_action(chat_id, msg_id, note_data)
         finally:
             _action_busy.discard(primary_id)
 
@@ -2244,7 +2691,7 @@ def run_telegram_bot() -> None:
 
     async def _handle_files_action(
         chat_id: int, prog_msg_id: int,
-        data: dict[str, Any], msg_file_path: str,
+        data: dict[str, Any],
     ) -> None:
         images_list = data.get('images_list', [])
         video_url = data.get('video_url', '')
@@ -2272,12 +2719,13 @@ def run_telegram_bot() -> None:
             return
 
         total = len(all_urls)
+        lang = data.get('lang', 'en')
         # Send a NEW progress message instead of overwriting the summary
         act_prog = await bot.send_message(
             chat_id,
-            _progress_text(f'📥 Downloading files (0/{total})...', 0),
+            _progress_text(_t('progress_downloading_files_n', lang, current=0, total=total), 0),
             reply_to=prog_msg_id, silent=True,
-            buttons=_progress_buttons(),
+            buttons=_progress_buttons(lang=lang),
         )
         ctrl = _ProgressControl(chat_id)
         ctrl_key = f'{chat_id}.{act_prog.id}'
@@ -2303,10 +2751,10 @@ def run_telegram_bot() -> None:
                     dl_mb = total_bytes / (1024 * 1024)
                     try:
                         await act_prog.edit(
-                            _progress_text(f'📥 Downloading files ({idx + 1}/{total})...',
+                            _progress_text(_t('progress_downloading_files_n', lang, current=idx+1, total=total),
                                            pct, f'{dl_mb:.1f} MB', dl_start,
                                            transferred_bytes=total_bytes),
-                            buttons=_progress_buttons(),
+                            buttons=_progress_buttons(lang=lang),
                         )
                     except MessageNotModifiedError:
                         pass
@@ -2314,13 +2762,13 @@ def run_telegram_bot() -> None:
             dl_elapsed = time.monotonic() - dl_start
             total_mb = total_bytes / (1024 * 1024)
             _dl_spd = _speed_str(dl_elapsed, total_bytes)
-            dl_summary = f'📥 Download: {dl_elapsed:.1f}s'
+            dl_summary = _t('summary_download_time', lang, elapsed=f'{dl_elapsed:.1f}')
             if _dl_spd:
                 dl_summary += f' ({_dl_spd})'
             try:
                 await act_prog.edit(
-                    f'{dl_summary}\n' + _progress_text(f'📤 Uploading {total} file(s) ({total_mb:.1f} MB)...', 0),
-                    buttons=_progress_buttons(),
+                    f'{dl_summary}\n' + _progress_text(_t('progress_uploading_files_size', lang, count=total, size_mb=f'{total_mb:.1f}'), 0),
+                    buttons=_progress_buttons(lang=lang),
                 )
             except MessageNotModifiedError:
                 pass
@@ -2349,10 +2797,10 @@ def run_telegram_bot() -> None:
                     try:
                         await act_prog.edit(
                             f'{dl_summary}\n' + _progress_text(
-                                f'📤 Uploading {total} file(s) ({total_mb:.1f} MB)...',
+                                _t('progress_uploading_files_size', lang, count=total, size_mb=f'{total_mb:.1f}'),
                                 overall_pct, f'{cur_mb:.1f}/{total_mb:.1f} MB',
                                 ul_start, transferred_bytes=overall),
-                            buttons=_progress_buttons(),
+                            buttons=_progress_buttons(lang=lang),
                         )
                     except MessageNotModifiedError:
                         pass
@@ -2375,17 +2823,16 @@ def run_telegram_bot() -> None:
             _ul_spd = _speed_str(ul_elapsed, total_bytes)
 
             # Build transfer summary for the main summary message
-            _parts = [f'📥 {dl_elapsed:.1f}s']
+            _parts = [_t('summary_download_time', lang, elapsed=f'{dl_elapsed:.1f}')]
             if _dl_spd:
                 _parts[0] += f' ({_dl_spd})'
-            _parts.append(f'📤 {ul_elapsed:.1f}s')
+            _parts.append(_t('summary_upload_time', lang, elapsed=f'{ul_elapsed:.1f}'))
             if _ul_spd:
                 _parts[1] += f' ({_ul_spd})'
             data['files_transfer_summary'] = '\n'.join(_parts)
 
             bot_logger.info(f"Sent {len(all_files)} file(s) via Files action")
-            with open(msg_file_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
+            botdb.update_message_state(data.get('_primary_id', ''), data)
             try:
                 await act_prog.delete()
             except Exception:
@@ -2395,8 +2842,7 @@ def run_telegram_bot() -> None:
         except _OperationCancelled:
             bot_logger.info("Files action cancelled")
             data.setdefault('reactions_used', {})['file'] = 'cancelled'
-            with open(msg_file_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
+            botdb.update_message_state(data.get('_primary_id', ''), data)
             try:
                 await act_prog.delete()
             except Exception:
@@ -2416,7 +2862,7 @@ def run_telegram_bot() -> None:
 
     async def _handle_live_action(
         chat_id: int, prog_msg_id: int,
-        data: dict[str, Any], msg_file_path: str,
+        data: dict[str, Any],
     ) -> None:
         images_list = data.get('images_list', [])
 
@@ -2438,12 +2884,13 @@ def run_telegram_bot() -> None:
             return
 
         total = len(live_items)
+        lang = data.get('lang', 'en')
         # Send a NEW progress message instead of overwriting the summary
         act_prog = await bot.send_message(
             chat_id,
-            _progress_text(f'📥 Downloading live photos (0/{total})...', 0),
+            _progress_text(_t('progress_downloading_live_n', lang, current=0, total=total), 0),
             reply_to=prog_msg_id, silent=True,
-            buttons=_progress_buttons(),
+            buttons=_progress_buttons(lang=lang),
         )
         ctrl = _ProgressControl(chat_id)
         ctrl_key = f'{chat_id}.{act_prog.id}'
@@ -2469,10 +2916,10 @@ def run_telegram_bot() -> None:
                     dl_mb = total_bytes / (1024 * 1024)
                     try:
                         await act_prog.edit(
-                            _progress_text(f'📥 Downloading live photos ({idx + 1}/{total})...',
+                            _progress_text(_t('progress_downloading_live_n', lang, current=idx+1, total=total),
                                            pct, f'{dl_mb:.1f} MB', dl_start,
                                            transferred_bytes=total_bytes),
-                            buttons=_progress_buttons(),
+                            buttons=_progress_buttons(lang=lang),
                         )
                     except MessageNotModifiedError:
                         pass
@@ -2480,13 +2927,13 @@ def run_telegram_bot() -> None:
             dl_elapsed = time.monotonic() - dl_start
             total_mb = total_bytes / (1024 * 1024)
             _dl_spd = _speed_str(dl_elapsed, total_bytes)
-            dl_summary = f'📥 Download: {dl_elapsed:.1f}s'
+            dl_summary = _t('summary_download_time', lang, elapsed=f'{dl_elapsed:.1f}')
             if _dl_spd:
                 dl_summary += f' ({_dl_spd})'
             try:
                 await act_prog.edit(
-                    f'{dl_summary}\n' + _progress_text(f'📤 Uploading {total} live photo(s) ({total_mb:.1f} MB)...', 0),
-                    buttons=_progress_buttons(),
+                    f'{dl_summary}\n' + _progress_text(_t('progress_uploading_live_size', lang, count=total, size_mb=f'{total_mb:.1f}'), 0),
+                    buttons=_progress_buttons(lang=lang),
                 )
             except MessageNotModifiedError:
                 pass
@@ -2515,10 +2962,10 @@ def run_telegram_bot() -> None:
                     try:
                         await act_prog.edit(
                             f'{dl_summary}\n' + _progress_text(
-                                f'📤 Uploading {total} live photo(s) ({total_mb:.1f} MB)...',
+                                _t('progress_uploading_live_size', lang, count=total, size_mb=f'{total_mb:.1f}'),
                                 overall_pct, f'{cur_mb:.1f}/{total_mb:.1f} MB',
                                 ul_start, transferred_bytes=overall),
-                            buttons=_progress_buttons(),
+                            buttons=_progress_buttons(lang=lang),
                         )
                     except MessageNotModifiedError:
                         pass
@@ -2541,16 +2988,15 @@ def run_telegram_bot() -> None:
             # Build transfer summary for the main summary message
             ul_elapsed = time.monotonic() - ul_start
             _ul_spd = _speed_str(ul_elapsed, total_bytes)
-            _parts = [f'📥 {dl_elapsed:.1f}s']
+            _parts = [_t('summary_download_time', lang, elapsed=f'{dl_elapsed:.1f}')]
             if _dl_spd:
                 _parts[0] += f' ({_dl_spd})'
-            _parts.append(f'📤 {ul_elapsed:.1f}s')
+            _parts.append(_t('summary_upload_time', lang, elapsed=f'{ul_elapsed:.1f}'))
             if _ul_spd:
                 _parts[1] += f' ({_ul_spd})'
             data['live_transfer_summary'] = '\n'.join(_parts)
 
-            with open(msg_file_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
+            botdb.update_message_state(data.get('_primary_id', ''), data)
             try:
                 await act_prog.delete()
             except Exception:
@@ -2560,8 +3006,7 @@ def run_telegram_bot() -> None:
         except _OperationCancelled:
             bot_logger.info("Live photos action cancelled")
             data.setdefault('reactions_used', {})['eyes'] = 'cancelled'
-            with open(msg_file_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
+            botdb.update_message_state(data.get('_primary_id', ''), data)
             try:
                 await act_prog.delete()
             except Exception:
@@ -2581,15 +3026,38 @@ def run_telegram_bot() -> None:
 
     async def _handle_ai_action(
         chat_id: int, prog_msg_id: int,
-        data: dict[str, Any], msg_file_path: str,
+        data: dict[str, Any],
     ) -> None:
-        await _run_ai_summary(bot, gemini_client, chat_id, prog_msg_id, msg_file_path, data)
+        await _run_ai_summary(bot, gemini_client, chat_id, prog_msg_id, data)
 
     # ── Note processing (main message handler) ────────────────────────────────
 
     async def _note2feed_internal(event: events.NewMessage.Event) -> None:
         chat_id = event.chat_id
         msg_id = event.id
+        sender = await event.get_sender()
+        tg_user_id = event.sender_id or 0
+        tg_username = getattr(sender, 'username', '') or ''
+        tg_first_name = getattr(sender, 'first_name', '') or ''
+        tg_last_name = getattr(sender, 'last_name', '') or ''
+
+        # Register / update user in DB
+        botdb.upsert_user(tg_user_id, tg_username, tg_first_name, tg_last_name)
+        user_lang = botdb.get_user_lang(tg_user_id)
+        user_prefs = botdb.get_user_prefs(tg_user_id)
+
+        # In groups, group settings override user settings
+        is_group_chat = not event.is_private
+        if is_group_chat:
+            group_prefs = botdb.get_group_prefs(chat_id)
+            user_lang = group_prefs['language']
+            user_prefs = {**user_prefs, **{
+                'send_as_file': group_prefs['send_as_file'],
+                'include_live': group_prefs['include_live'],
+                'use_xsec': group_prefs['use_xsec'],
+                'keep_original': group_prefs['keep_original'],
+            }}
+
         # event.text already returns the caption for photo/video messages in Telethon
         message_text = event.text or ''
 
@@ -2606,7 +3074,11 @@ def run_telegram_bot() -> None:
                     if obj.type == 'QRCODE':
                         qr_data = obj.data.decode('utf-8')
                         bot_logger.info(f"QR Code detected: {qr_data}")
-                        message_text += f' {qr_data} '
+                        # Only act on QR codes that contain an XHS link
+                        if 'xhslink.com' in qr_data or 'xiaohongshu.com' in qr_data:
+                            message_text += f' {qr_data} '
+                        else:
+                            bot_logger.debug(f"QR Code ignored (no XHS link): {qr_data}")
             except Exception as e:
                 bot_logger.error(f"Failed to decode QR code: {e}")
 
@@ -2617,10 +3089,22 @@ def run_telegram_bot() -> None:
         noteId = str(url_info['noteId'])
         xsec_token = str(url_info['xsec_token'])
         anchorCommentId = str(url_info['anchorCommentId'])
+        had_multiple_links = bool(url_info.get('had_multiple', False))
         bot_logger.info(
             f'Note ID: {noteId}, xsec_token: {xsec_token if xsec_token else "None"}, '
             f'anchorCommentId: {anchorCommentId if anchorCommentId else "None"}'
+            f'{", MULTI-LINK (first used)" if had_multiple_links else ""}'
         )
+
+        # Parse -r media range
+        media_range = parse_media_range(message_text)
+        if media_range is not None and not media_range:
+            # parse returned None-like falsy → invalid format was entered
+            try:
+                await event.respond(_t('range_invalid', user_lang))
+            except Exception:
+                pass
+            return
 
         # React with 👌
         try:
@@ -2641,15 +3125,13 @@ def run_telegram_bot() -> None:
 
         try:
             note_data = requests.get(f"https://{FLASK_SERVER_NAME}/get_note/{noteId}").json()
-            with open(os.path.join('data', f'note_data-{noteId}.json'), 'w', encoding='utf-8') as f:
-                json.dump(note_data, f, indent=4, ensure_ascii=False)
+            botdb.save_note_cache(noteId, note_data=note_data)
             times = 0
             while True:
                 times += 1
                 try:
                     comment_list_data = requests.get(f"https://{FLASK_SERVER_NAME}/get_comment_list/{noteId}").json()
-                    with open(os.path.join('data', f'comment_list_data-{noteId}.json'), 'w', encoding='utf-8') as f:
-                        json.dump(comment_list_data, f, indent=4, ensure_ascii=False)
+                    botdb.save_note_cache(noteId, comment_list_data=comment_list_data)
                     bot_logger.debug('got comment list data')
                     break
                 except Exception:
@@ -2682,10 +3164,11 @@ def run_telegram_bot() -> None:
                 await telegraph_account.create_account(short_name='@xhsfwbot')  # type: ignore
 
             # Parse flags: -x, -l, -f (or combined like -xl, -xlf, -fxl, etc.)
+            # User preferences serve as defaults; explicit flags override them.
             flag_chars = set()
             for m in re.finditer(r'(?<!\S)-([xlf]+)(?!\S)', message_text):
                 flag_chars.update(m.group(1))
-            use_xsec = ('x' in flag_chars) and xsec_token
+            use_xsec = (('x' in flag_chars) or user_prefs['use_xsec']) and xsec_token
             note = Note(
                 note_data['data'],
                 comment_list_data=comment_list_data['data'],
@@ -2696,20 +3179,51 @@ def run_telegram_bot() -> None:
             )
             await note.initialize()
 
+            # Log telegraph URL to database
+            _note_images = len([i for i in note.images_list if not i.get('live')])
+            _note_videos = 1 if note.video_url else 0
+            try:
+                botdb.log_telegraph(
+                    note_id=noteId,
+                    note_title=note.title,
+                    note_type=note.type,
+                    telegraph_url=note.telegraph_url if hasattr(note, 'telegraph_url') else '',
+                    tg_user_id=tg_user_id,
+                    tg_username=tg_username,
+                    tg_first_name=tg_first_name,
+                    tg_last_name=tg_last_name,
+                    tg_chat_id=chat_id,
+                    tg_message_id=msg_id,
+                    xsec_token=xsec_token,
+                    image_count=_note_images,
+                    video_count=_note_videos,
+                )
+            except Exception as e:
+                bot_logger.error(f"Failed to log telegraph: {e}")
+
             _prog_ctrl_key: str | None = None
             # Extract original xhslink URL for abort buttons
             _xhslink_match = re.search(r'https?://(?:www\.)?xhslink\.com/\S+', message_text)
             _original_url = _xhslink_match.group(0) if _xhslink_match else ''
             try:
-                send_as_file = 'f' in flag_chars
-                include_live_videos = 'l' in flag_chars
+                send_as_file = 'f' in flag_chars or user_prefs['send_as_file']
+                include_live_videos = 'l' in flag_chars or user_prefs['include_live']
+
+                # Build initial progress bar text with notices
+                _notices: list[str] = []
+                if had_multiple_links:
+                    _notices.append(_t('multi_link_notice', user_lang))
+                if media_range:
+                    _range_display = format_range_display(media_range[0])
+                    _notices.append(_t('range_notice', user_lang, range=_range_display))
+                _notice_text = '\n'.join(_notices) + '\n' if _notices else ''
 
                 # Create early progress bar
                 progress_msg = await bot.send_message(
                     chat_id,
-                    _progress_text('📝 Creating Telegraph page...', 0),
+                    _notice_text + _progress_text(_t('progress_telegraph_creating', user_lang), 0),
                     reply_to=msg_id, silent=True,
-                    buttons=_progress_buttons(),
+                    buttons=_progress_buttons(lang=user_lang),
                 )
                 _prog_ctrl = _ProgressControl(chat_id)
                 _prog_ctrl_key = f'{chat_id}.{progress_msg.id}'
@@ -2724,8 +3238,8 @@ def run_telegram_bot() -> None:
                 _tg_url = note.telegraph_url if hasattr(note, 'telegraph_url') else ''
                 try:
                     await progress_msg.edit(
-                        f'✅ Telegraph created ({tg_elapsed:.1f}s)\n📋 Preparing message...',
-                        buttons=_progress_buttons(telegraph_url=_tg_url),
+                        _t('progress_telegraph_done', user_lang, elapsed=f'{tg_elapsed:.1f}') + '\n' + _t('progress_preparing_msg', user_lang),
+                        buttons=_progress_buttons(telegraph_url=_tg_url, lang=user_lang),
                     )
                 except MessageNotModifiedError:
                     pass
@@ -2734,8 +3248,8 @@ def run_telegram_bot() -> None:
 
                 try:
                     await progress_msg.edit(
-                        f'✅ Telegraph created ({tg_elapsed:.1f}s)\n📦 Sending media...',
-                        buttons=_progress_buttons(telegraph_url=_tg_url),
+                        _t('progress_telegraph_done', user_lang, elapsed=f'{tg_elapsed:.1f}') + '\n' + _t('progress_sending_media', user_lang),
+                        buttons=_progress_buttons(telegraph_url=_tg_url, lang=user_lang),
                     )
                 except MessageNotModifiedError:
                     pass
@@ -2750,28 +3264,32 @@ def run_telegram_bot() -> None:
                     _progress_ctrl=_prog_ctrl,
                     original_url=_original_url,
                     anchor_comment_id=anchorCommentId,
+                    media_range=media_range,
+                    lang=user_lang,
                 )
 
                 # Delete user's original message
-                try:
-                    await bot.delete_messages(chat_id, msg_id)
-                except Exception as e:
-                    bot_logger.debug(f"Failed to delete user message: {e}")
+                if not user_prefs.get('keep_original'):
+                    try:
+                        await bot.delete_messages(chat_id, msg_id)
+                    except Exception as e:
+                        bot_logger.debug(f"Failed to delete user message: {e}")
 
             except _OperationCancelled:
                 bot_logger.info(f"Main flow cancelled by user for chat {chat_id}")
                 _tg_url = note.telegraph_url if hasattr(note, 'telegraph_url') else ''
                 try:
                     await progress_msg.edit(
-                        '❌ Cancelled',
+                        _t('cancelled', user_lang),
                         buttons=_abort_url_buttons(noteId, anchorCommentId, xsec_token, _original_url, _tg_url),
                     )
                 except Exception:
                     pass
-                try:
-                    await bot.delete_messages(chat_id, msg_id)
-                except Exception:
-                    pass
+                if not user_prefs.get('keep_original'):
+                    try:
+                        await bot.delete_messages(chat_id, msg_id)
+                    except Exception:
+                        pass
             except Exception:
                 bot_logger.error(traceback.format_exc())
                 try:
@@ -2850,8 +3368,7 @@ def run_telegram_bot() -> None:
 
         try:
             note_data = requests.get(f"https://{FLASK_SERVER_NAME}/get_note/{noteId}").json()
-            with open(os.path.join('data', f'note_data-{noteId}.json'), 'w', encoding='utf-8') as f:
-                json.dump(note_data, f, indent=4, ensure_ascii=False)
+            botdb.save_note_cache(noteId, note_data=note_data)
         except Exception:
             bot_logger.error(traceback.format_exc())
         finally:
@@ -2972,6 +3489,49 @@ def run_telegram_bot() -> None:
                 await bot.send_message(admin_id, '\n'.join(info_lines), parse_mode='html', silent=True)
             except Exception as e:
                 bot_logger.error(f"Failed to send startup info to admin: {e}")
+
+        # ── Daily report task ─────────────────────────────────────────────
+        async def _daily_report_task() -> None:
+            """Send a daily summary CSV to admin at 23:59 UTC+8."""
+            _utc8 = timezone(timedelta(hours=8))
+            while True:
+                try:
+                    now = datetime.now(_utc8)
+                    # Next 23:59 today or tomorrow
+                    target = now.replace(hour=23, minute=59, second=0, microsecond=0)
+                    if now >= target:
+                        target += timedelta(days=1)
+                    wait_seconds = (target - now).total_seconds()
+                    await asyncio.sleep(wait_seconds)
+                    if not admin_id:
+                        continue
+                    today = datetime.now(_utc8).strftime('%Y-%m-%d')
+                    summary = botdb.get_daily_summary(today)
+                    if not summary or summary.get('total_telegraphs', 0) == 0:
+                        continue
+                    csv_content = botdb.generate_report_csv(today)
+                    if not csv_content or csv_content.count('\n') <= 1:
+                        continue
+                    date_compact = today.replace('-', '')
+                    import io as _io
+                    buf = _io.BytesIO(csv_content.encode('utf-8-sig'))
+                    buf.name = f'daily_{date_compact}.csv'
+                    s = summary
+                    caption = (
+                        f"📊 <b>Daily Report — {today}</b>\n\n"
+                        f"Total: {s.get('total_telegraphs', 0)} | "
+                        f"Users: {s.get('unique_users', 0)} | "
+                        f"Images: {s.get('total_images', 0)} | "
+                        f"Videos: {s.get('total_videos', 0)}"
+                    )
+                    await bot.send_file(admin_id, buf, caption=caption, parse_mode='html', silent=True)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    bot_logger.error(f"Daily report task error: {e}")
+                    await asyncio.sleep(3600)  # retry in 1h on error
+
+        asyncio.get_event_loop().create_task(_daily_report_task())
 
         await bot.run_until_disconnected()
 

@@ -1,8 +1,8 @@
 # Environment variables
 .env
-whitelist.json
 .nginx.conf
 help_config.json
+*.session
 
 # Python
 __pycache__/
@@ -43,3 +43,8 @@ Thumbs.db
 *.log
 log/
 data/
+
+# Database
+*.db
+*.db-shm
+*.db-wal

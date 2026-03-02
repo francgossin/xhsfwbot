@@ -77,7 +77,7 @@ class BlockURLs:
             flow.response.status_code = 345
             flow.response.content = b"{'fuckxhs': true}"
             view = ctx.master.addons.get("view") # type: ignore
-            if view.store_count() >= 10: # type: ignore
+            if view is not None and view.store_count() >= 10: # type: ignore
                 view.clear() # type: ignore
 
 def get_block_pattern_list() -> list[str]:
